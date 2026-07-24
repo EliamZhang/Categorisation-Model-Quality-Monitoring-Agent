@@ -32,6 +32,25 @@ from openpyxl.utils import get_column_letter
 # ═══════════════════════════════════════════════════════════════════
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _load_dotenv(path: Path | None = None) -> None:
+    """Load .env file into os.environ (no dependencies)."""
+    env_file = path or (PROJECT_ROOT / ".env")
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if key and key not in os.environ:  # don't override existing env vars
+            os.environ[key] = val
+
+
+_load_dotenv()
+
 INPUT_FILE = PROJECT_ROOT / "classification_report.xlsx"
 OUTPUT_METRICS = PROJECT_ROOT / "category_quality_metrics.xlsx"
 OUTPUT_AI = PROJECT_ROOT / "disagreement_ai_analysis.xlsx"

@@ -1,3 +1,6 @@
+# Secrets
+.env
+
 # Input data (large)
 classification_report.xlsx
 
