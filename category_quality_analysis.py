@@ -57,7 +57,7 @@ OUTPUT_AI = PROJECT_ROOT / "disagreement_ai_analysis.xlsx"
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1/chat/completions"
-DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
 
 SAMPLE_PER_CATEGORY = 30  # 每个 category 组采样数
 API_RETRY_COUNT = 3
