@@ -1,0 +1,17 @@
+# Input data (large)
+classification_report.xlsx
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Temp
+_verify_chinese.txt
