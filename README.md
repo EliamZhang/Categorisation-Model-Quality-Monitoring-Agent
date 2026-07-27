@@ -20,8 +20,10 @@ Reads `classification_report.xlsx` → computes metrics → calls DeepSeek V4 fo
 
 | File | Sheets | Description |
 |---|---|---|
-| `category_quality_metrics.xlsx` | `summary` | 6 coverage & disagreement metrics |
-| | `category_ranking` | Per-category disagreement ranking |
+| `category_quality_metrics.xlsx` | `summary` | Coverage, disagreement, one-sided gap, counterparty, and AI audit metrics |
+| | `category_ranking` | Per-illion-category ranking with strict-mismatch finv Top 3 flows |
+| | `illion_only_categories` | Categories illion has while finv is empty, with gap distribution and finv missing rate |
+| | `finv_only_categories` | Categories finv has while illion is empty or `All Other Credits`, with source-state split |
 | | `disagreement_samples` | Sampled rows sent to AI |
 | `disagreement_ai_analysis.xlsx` | `ai_row_analysis` | AI judgment per row (who is more accurate) |
 | | `todos` | Actionable fixes for finv, ranked by priority |
@@ -48,12 +50,25 @@ illion `third_party` often equals its own `category` (e.g. `category="Groceries"
 
 Example: illion labeled 202 rows as "Rent". finv classified 123 of them — but **none** as Rent (86→External Transfers, 35→Wages), and left 79 rows blank. Strict = 100%, Broad = 100%.
 
+### finv Strict-Mismatch Top 3
+
+`finv不一致Top3类别` shows the three most frequent finv categories only among
+the strict-mismatch rows for each illion category. Each percentage uses that
+illion category's strict mismatch count as its denominator, so records where
+the two systems agree do not appear in the flow.
+
 ## AI Analysis Pipeline
 
 1. Sample up to 30 disagreement rows per finv category (590 total across 28 categories)
 2. Send batches of 20 rows to **DeepSeek V4** (`deepseek-chat`) with transaction text, amount, counterparty, and both classifications
 3. AI judges each row: `illion更准` / `finv更准` / `都合理` / `都不对` / `不确定`
 4. AI generates prioritized TODOs for finv: knowledge base updates, rule fixes, keyword tuning
+
+To regenerate both reports from the saved AI analysis without calling DeepSeek:
+
+```bash
+python category_quality_analysis.py --reuse-ai-analysis
+```
 
 ### Key Finding (July 2026 run)
 

@@ -134,6 +134,32 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         )
         self.assertIn("AI分析", summary_text)
 
+    def test_load_existing_ai_analysis_drops_excel_index_column(self) -> None:
+        path = Path(self._testMethodName + ".xlsx")
+        self.addCleanup(path.unlink, missing_ok=True)
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            pd.DataFrame({
+                "序号": [1],
+                "judgment": ["illion更准"],
+            }).to_excel(writer, sheet_name="ai_row_analysis", index=False)
+            pd.DataFrame({
+                "序号": [1],
+                "action": ["one"],
+            }).to_excel(writer, sheet_name="todos", index=False)
+
+        loader = getattr(analysis, "load_existing_ai_analysis", None)
+        self.assertIsNotNone(loader)
+        rows, todos = loader(path)
+
+        self.assertEqual(rows, [{"judgment": "illion更准"}])
+        self.assertEqual(todos, [{"action": "one"}])
+
+    def test_reuse_ai_analysis_flag_is_enabled(self) -> None:
+        fallback = type("Args", (), {"reuse_ai_analysis": False})()
+        parse_args = getattr(analysis, "parse_args", lambda _args: fallback)
+
+        self.assertTrue(parse_args(["--reuse-ai-analysis"]).reuse_ai_analysis)
+
 
 if __name__ == "__main__":
     unittest.main()

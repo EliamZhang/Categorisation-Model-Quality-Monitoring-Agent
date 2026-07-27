@@ -15,6 +15,7 @@ Category Quality Assessment — 完整分析流水线
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import time
@@ -352,6 +353,19 @@ def compute_ai_metrics(row_results: list[dict], todos: list[dict]) -> dict[str, 
         metrics[f"{key}_count"] = count
         metrics[f"{key}_pct"] = round(count / success * 100, 2) if success else 0.0
     return metrics
+
+
+def load_existing_ai_analysis(path: Path) -> tuple[list[dict], list[dict]]:
+    """Load saved AI rows and TODOs for an offline metrics refresh."""
+    if not path.exists():
+        raise FileNotFoundError(f"AI analysis workbook not found: {path}")
+
+    def read_records(sheet_name: str) -> list[dict]:
+        frame = pd.read_excel(path, sheet_name=sheet_name)
+        frame = frame.drop(columns=["序号"], errors="ignore")
+        return frame.where(pd.notna(frame), None).to_dict(orient="records")
+
+    return read_records("ai_row_analysis"), read_records("todos")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -970,7 +984,21 @@ def _auto_width(ws, min_w: int = 8, max_w: int = 50) -> None:
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse pipeline options without coupling tests to process arguments."""
+    parser = argparse.ArgumentParser(
+        description="Compare illion and finv transaction categories."
+    )
+    parser.add_argument(
+        "--reuse-ai-analysis",
+        action="store_true",
+        help="Reuse disagreement_ai_analysis.xlsx instead of calling DeepSeek.",
+    )
+    return parser.parse_args(argv)
+
+
 def main() -> None:
+    args = parse_args()
     print("=" * 60)
     print("  Category Quality Assessment Pipeline")
     print("=" * 60)
@@ -1001,41 +1029,41 @@ def main() -> None:
     for r in ranking[:10]:
         print(f"    {r['illion_category']:30s} 不一致: {r['不一致数']:4d}  "
               f"({r['不一致率(vs finv有值)']}% vs finv有值)  "
-              f"finv对应: {r['finv对应top类别']}")
+              f"finv不一致Top3: {r['finv不一致Top3类别']}")
 
     # ── Step 4: Sample disagreements ──
     print("\n[4/5] Sampling disagreement rows for AI analysis...")
     sample_df = sample_disagreements(df)
     print(f"  Sampled {len(sample_df)} rows across {sample_df['finv_category'].nunique()} categories")
 
-    # ── 先写出 metrics xlsx ──
-    print("\n[5a/5] Writing metrics report...")
-    write_metrics_xlsx(results, ranking, sample_df, OUTPUT_METRICS)
-    print(f"  → {OUTPUT_METRICS.name} written")
-
     # ── Step 5: AI Analysis ──
-    print("\n[5b/5] Running DeepSeek AI analysis...")
-    print(f"  API: {DEEPSEEK_BASE_URL}")
-    print(f"  Model: {DEEPSEEK_MODEL}")
-    print(f"  Total rows to analyze: {len(sample_df)}")
+    if args.reuse_ai_analysis:
+        print("\n[5/5] Reusing saved AI analysis...")
+        row_results, todos = load_existing_ai_analysis(OUTPUT_AI)
+        print(f"  Reused {len(row_results)} AI rows and {len(todos)} TODOs")
+    else:
+        print("\n[5/5] Running DeepSeek AI analysis...")
+        print(f"  API: {DEEPSEEK_BASE_URL}")
+        print(f"  Model: {DEEPSEEK_MODEL}")
+        print(f"  Total rows to analyze: {len(sample_df)}")
+        row_results, todos = analyze_disagreements(sample_df)
 
-    row_results, todos = analyze_disagreements(sample_df)
+    ai_metrics = compute_ai_metrics(row_results, todos)
 
     if row_results:
-        # 统计
-        from collections import Counter
-        judgment_counts = Counter(r["judgment"] for r in row_results)
         print(f"\n  AI Analysis Summary:")
-        print(f"    illion更准: {judgment_counts.get('illion更准', 0)}")
-        print(f"    finv更准:   {judgment_counts.get('finv更准', 0)}")
-        print(f"    都合理:     {judgment_counts.get('都合理', 0)}")
-        print(f"    都不对:     {judgment_counts.get('都不对', 0)}")
-        print(f"    不确定:     {judgment_counts.get('不确定', 0)}")
-        print(f"    errors:     {judgment_counts.get('api_error', 0) + judgment_counts.get('parse_error', 0)}")
+        print(f"    illion更准: {ai_metrics['ai_illion_better_count']}")
+        print(f"    finv更准:   {ai_metrics['ai_finv_better_count']}")
+        print(f"    都合理:     {ai_metrics['ai_both_reasonable_count']}")
+        print(f"    都不对:     {ai_metrics['ai_both_wrong_count']}")
+        print(f"    不确定:     {ai_metrics['ai_uncertain_count']}")
+        print(f"    errors:     {ai_metrics['ai_failed_count']}")
         print(f"  TODOs generated: {len(todos)}")
 
     write_ai_analysis_xlsx(row_results, todos, OUTPUT_AI)
     print(f"  → {OUTPUT_AI.name} written")
+    write_metrics_xlsx(results, ranking, sample_df, OUTPUT_METRICS, ai_metrics)
+    print(f"  → {OUTPUT_METRICS.name} written")
 
     print("\n" + "=" * 60)
     print("  DONE!")
