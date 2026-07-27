@@ -4,6 +4,9 @@
 # Input data (large)
 classification_report.xlsx
 
+# Local planning and design notes
+/docs/
+
 # Python
 __pycache__/
 *.pyc
