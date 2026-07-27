@@ -244,11 +244,16 @@ def compute_all_metrics(df: pd.DataFrame) -> dict[str, Any]:
                 round((cat_disagree.sum() + cat_fv_empty.sum()) / cat_total * 100, 1)
                 if cat_total > 0 else 0.0
             ),
-            "finv对应top类别": _top_finv_cats(df, cat_mask, fv_cat_eff),
+            "finv不一致Top3类别": _top_finv_mismatch_cats(df, cat_disagree),
         })
     results["category_ranking"] = sorted(
         rank_rows, key=lambda r: r["不一致数"], reverse=True
     )
+
+    (
+        results["illion_only_categories"],
+        results["finv_only_categories"],
+    ) = _coverage_gap_distributions(df, il_cat_eff, fv_cat_eff)
 
     # ── extras: counterparty 相关 ──
     cp_both = fv_tp_eff & il_tp_eff
@@ -269,12 +274,56 @@ def compute_all_metrics(df: pd.DataFrame) -> dict[str, Any]:
     return results
 
 
-def _top_finv_cats(df: pd.DataFrame, mask: pd.Series,
-                   fv_eff: pd.Series, top_n: int = 3) -> str:
-    """Return top N finv categories for rows matching `mask`."""
-    counts = df.loc[mask & fv_eff, "finv_category"].value_counts()
-    items = [f"{k}({v})" for k, v in counts.head(top_n).items()]
-    return ", ".join(items) if items else "—"
+def _top_finv_mismatch_cats(df: pd.DataFrame, mismatch_mask: pd.Series,
+                             top_n: int = 3) -> str:
+    """Return top finv categories among strict mismatch rows only."""
+    counts = df.loc[mismatch_mask, "finv_category"].value_counts()
+    total = int(counts.sum())
+    if total == 0:
+        return "-"
+    return ", ".join(
+        f"{category} ({count:,}, {count / total * 100:.1f}%)"
+        for category, count in counts.head(top_n).items()
+    )
+
+
+def _coverage_gap_distributions(
+    df: pd.DataFrame, il_cat_eff: pd.Series, fv_cat_eff: pd.Series,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Group categories present in one system while absent in the other."""
+    illion_only = il_cat_eff & ~fv_cat_eff
+    finv_only = ~il_cat_eff & fv_cat_eff
+    illion_gap_total = int(illion_only.sum())
+    finv_gap_total = int(finv_only.sum())
+
+    illion_rows = []
+    for category, count in df.loc[illion_only, "category"].value_counts().items():
+        category_total = int((il_cat_eff & (df["category"] == category)).sum())
+        illion_rows.append({
+            "illion_category": category,
+            "缺口数": int(count),
+            "占illion单边缺口": round(count / illion_gap_total * 100, 1),
+            "illion有效总数": category_total,
+            "finv缺失率": round(count / category_total * 100, 1),
+        })
+
+    finv_rows = []
+    for category, count in df.loc[finv_only, "finv_category"].value_counts().items():
+        category_total = int((fv_cat_eff & (df["finv_category"] == category)).sum())
+        category_mask = finv_only & (df["finv_category"] == category)
+        finv_rows.append({
+            "finv_category": category,
+            "缺口数": int(count),
+            "占finv单边缺口": round(count / finv_gap_total * 100, 1),
+            "finv有效总数": category_total,
+            "illion无效率": round(count / category_total * 100, 1),
+            "illion为空": int((category_mask & df["category"].isna()).sum()),
+            "illion为All Other Credits": int(
+                (category_mask & (df["category"] == "All Other Credits")).sum()
+            ),
+        })
+
+    return illion_rows, finv_rows
 
 
 # ═══════════════════════════════════════════════════════════════════
