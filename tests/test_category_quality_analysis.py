@@ -154,13 +154,10 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         self.assertEqual(rows, [{"judgment": "illion更准"}])
         self.assertEqual(todos, [{"action": "one"}])
 
-    def test_ai_analysis_is_reused_by_default_with_live_opt_in(self) -> None:
-        self.assertTrue(analysis.parse_args([]).reuse_ai_analysis)
+    def test_live_ai_analysis_is_default_with_optional_reuse(self) -> None:
+        self.assertFalse(analysis.parse_args([]).reuse_ai_analysis)
         self.assertTrue(
             analysis.parse_args(["--reuse-ai-analysis"]).reuse_ai_analysis
-        )
-        self.assertFalse(
-            analysis.parse_args(["--run-ai-analysis"]).reuse_ai_analysis
         )
 
 

@@ -8,7 +8,7 @@ Compare **finv** (internal) vs **illion** (external reference) transaction class
 python category_quality_analysis.py
 ```
 
-Reads `classification_report.xlsx` → computes metrics → reuses the saved AI audit → writes two reports with the AI summary.
+Reads `classification_report.xlsx` → computes metrics → calls DeepSeek V4 for a new AI row-by-row audit → writes two reports with the AI summary.
 
 ## Input
 
@@ -64,17 +64,17 @@ the two systems agree do not appear in the flow.
 3. AI judges each row: `illion更准` / `finv更准` / `都合理` / `都不对` / `不确定`
 4. AI generates prioritized TODOs for finv: knowledge base updates, rule fixes, keyword tuning
 
-By default, report generation reuses `disagreement_ai_analysis.xlsx` and
-includes its audit metrics in `summary` without calling DeepSeek:
+By default, report generation runs a new DeepSeek audit, then includes that
+run's audit metrics in `summary`:
 
 ```bash
 python category_quality_analysis.py
 ```
 
-To run a new DeepSeek audit before regenerating both reports:
+To regenerate both reports from the saved AI analysis without calling DeepSeek:
 
 ```bash
-python category_quality_analysis.py --run-ai-analysis
+python category_quality_analysis.py --reuse-ai-analysis
 ```
 
 ### Key Finding (July 2026 run)
