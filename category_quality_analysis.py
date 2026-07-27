@@ -20,6 +20,7 @@ import os
 import time
 import urllib.request
 import urllib.error
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,13 @@ API_RETRY_DELAY = 5  # seconds
 
 # illion category 中不算"有效覆盖"的值
 ILLION_UNCOVERED_CATS: frozenset[str] = frozenset({"All Other Credits"})
+AI_JUDGMENT_METRICS = (
+    ("illion更准", "ai_illion_better"),
+    ("finv更准", "ai_finv_better"),
+    ("都合理", "ai_both_reasonable"),
+    ("都不对", "ai_both_wrong"),
+    ("不确定", "ai_uncertain"),
+)
 
 # ═══════════════════════════════════════════════════════════════════
 #  STYLING
@@ -324,6 +332,26 @@ def _coverage_gap_distributions(
         })
 
     return illion_rows, finv_rows
+
+
+def compute_ai_metrics(row_results: list[dict], todos: list[dict]) -> dict[str, Any]:
+    """Summarize AI judgments with successful analyses as the denominator."""
+    judgment_counts = Counter(str(row.get("judgment") or "") for row in row_results)
+    total = len(row_results)
+    success = sum(judgment_counts[judgment] for judgment, _ in AI_JUDGMENT_METRICS)
+    metrics: dict[str, Any] = {
+        "ai_total_count": total,
+        "ai_success_count": success,
+        "ai_success_pct": round(success / total * 100, 2) if total else 0.0,
+        "ai_failed_count": total - success,
+        "ai_failed_pct": round((total - success) / total * 100, 2) if total else 0.0,
+        "ai_todo_count": len(todos),
+    }
+    for judgment, key in AI_JUDGMENT_METRICS:
+        count = judgment_counts[judgment]
+        metrics[f"{key}_count"] = count
+        metrics[f"{key}_pct"] = round(count / success * 100, 2) if success else 0.0
+    return metrics
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -601,14 +629,22 @@ def _parse_ai_response(content: str) -> dict | None:
 # ═══════════════════════════════════════════════════════════════════
 
 def write_metrics_xlsx(results: dict, ranking: list[dict],
-                       sample_df: pd.DataFrame, path: Path) -> None:
+                       sample_df: pd.DataFrame, path: Path,
+                       ai_metrics: dict[str, Any] | None = None) -> None:
     """写入指标 xlsx."""
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         # ── Sheet 1: Summary ──
-        _write_summary_sheet(writer, results)
+        _write_summary_sheet(writer, results, ai_metrics)
         # ── Sheet 2: Category Ranking ──
         _write_ranking_sheet(writer, ranking)
-        # ── Sheet 3: Disagreement Samples ──
+        # ── Sheets 3-4: One-sided coverage gaps ──
+        _write_distribution_sheet(
+            writer, "illion_only_categories", results["illion_only_categories"]
+        )
+        _write_distribution_sheet(
+            writer, "finv_only_categories", results["finv_only_categories"]
+        )
+        # ── Sheet 5: Disagreement Samples ──
         if not sample_df.empty:
             sample_df.to_excel(writer, sheet_name="disagreement_samples", index=False)
 
@@ -619,7 +655,8 @@ def write_metrics_xlsx(results: dict, ranking: list[dict],
             _auto_width(ws)
 
 
-def _write_summary_sheet(writer, results: dict) -> None:
+def _write_summary_sheet(writer, results: dict,
+                         ai_metrics: dict[str, Any] | None = None) -> None:
     """写入指标汇总 sheet."""
     n = results["total_rows"]
     rows = [
@@ -675,7 +712,15 @@ def _write_summary_sheet(writer, results: dict) -> None:
          f"{results['fv_empty_il_coverage_count']:,} / {results['fv_empty_count']:,} = {results['fv_empty_il_coverage_pct']}%",
          "finv 缺失时 illion 仍能覆盖的比例"],
         [""],
-        ["═══ 6. Counterparty 对比 ═══"],
+        ["═══ 6. 单边 Category 覆盖缺口分布 ═══"],
+        ["illion 有、finv 无 Category",
+         f"{results['il_has_fv_empty_count']:,} / {results['il_cat_eff_count']:,} = {results['il_has_fv_empty_count'] / results['il_cat_eff_count'] * 100:.2f}%",
+         "详见 illion_only_categories：按 illion category 分布"],
+        ["finv 有、illion 无有效 Category",
+         f"{results['il_empty_fv_coverage_count']:,} / {results['fv_cat_eff_count']:,} = {results['il_empty_fv_coverage_count'] / results['fv_cat_eff_count'] * 100:.2f}%",
+         "详见 finv_only_categories：区分 illion 为空和 All Other Credits"],
+        [""],
+        ["═══ 7. Counterparty 对比 ═══"],
         ["双方都有有效 Counterparty",
          f"{results['cp_both_count']:,}",
          ""],
@@ -683,6 +728,39 @@ def _write_summary_sheet(writer, results: dict) -> None:
          f"{results['cp_exact_match_count']:,} / {results['cp_both_count']:,} = {results['cp_exact_match_pct']}%",
          ""],
     ]
+
+    if ai_metrics is not None:
+        rows.extend([
+            [""],
+            ["═══ 8. AI分析（严格不一致抽样） ═══"],
+            ["AI 抽样行数",
+             f"{ai_metrics['ai_total_count']:,}",
+             "仅针对严格不一致样本；不代表全量交易准确率"],
+            ["AI 成功解析",
+             f"{ai_metrics['ai_success_count']:,} / {ai_metrics['ai_total_count']:,} = {ai_metrics['ai_success_pct']}%",
+             "以下 AI 判断占比均以成功解析行数为分母"],
+            ["illion 更准",
+             f"{ai_metrics['ai_illion_better_count']:,} / {ai_metrics['ai_success_count']:,} = {ai_metrics['ai_illion_better_pct']}%",
+             "AI 判断 illion 的类别更准确"],
+            ["finv 更准",
+             f"{ai_metrics['ai_finv_better_count']:,} / {ai_metrics['ai_success_count']:,} = {ai_metrics['ai_finv_better_pct']}%",
+             "AI 判断 finv 的类别更准确"],
+            ["双方都合理",
+             f"{ai_metrics['ai_both_reasonable_count']:,} / {ai_metrics['ai_success_count']:,} = {ai_metrics['ai_both_reasonable_pct']}%",
+             "双方分类都可接受"],
+            ["双方都不对",
+             f"{ai_metrics['ai_both_wrong_count']:,} / {ai_metrics['ai_success_count']:,} = {ai_metrics['ai_both_wrong_pct']}%",
+             "AI 判断两边分类均不准确"],
+            ["AI 不确定",
+             f"{ai_metrics['ai_uncertain_count']:,} / {ai_metrics['ai_success_count']:,} = {ai_metrics['ai_uncertain_pct']}%",
+             "交易文本不足以判断"],
+            ["AI 失败（API/解析）",
+             f"{ai_metrics['ai_failed_count']:,} / {ai_metrics['ai_total_count']:,} = {ai_metrics['ai_failed_pct']}%",
+             "未成功解析的 AI 返回"],
+            ["AI 生成 finv TODO",
+             f"{ai_metrics['ai_todo_count']:,}",
+             "详见 disagreement_ai_analysis.xlsx 的 todos"],
+        ])
 
     df = pd.DataFrame(rows)
     df.to_excel(writer, sheet_name="summary", index=False, header=False)
@@ -701,6 +779,11 @@ def _write_summary_sheet(writer, results: dict) -> None:
         else:
             ws.cell(row=row_idx, column=1).font = Font(bold=True, size=10)
             ws.cell(row=row_idx, column=2).alignment = Alignment(horizontal="left")
+
+
+def _write_distribution_sheet(writer, sheet_name: str, rows: list[dict]) -> None:
+    """Write one directional category coverage-gap distribution."""
+    pd.DataFrame(rows).to_excel(writer, sheet_name=sheet_name, index=False)
 
 
 def _write_ranking_sheet(writer, ranking: list[dict]) -> None:
