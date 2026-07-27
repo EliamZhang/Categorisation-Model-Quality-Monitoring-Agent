@@ -989,10 +989,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare illion and finv transaction categories."
     )
-    parser.add_argument(
+    ai_mode = parser.add_mutually_exclusive_group()
+    parser.set_defaults(reuse_ai_analysis=True)
+    ai_mode.add_argument(
         "--reuse-ai-analysis",
         action="store_true",
-        help="Reuse disagreement_ai_analysis.xlsx instead of calling DeepSeek.",
+        help="Reuse disagreement_ai_analysis.xlsx instead of calling DeepSeek (default).",
+    )
+    ai_mode.add_argument(
+        "--run-ai-analysis",
+        dest="reuse_ai_analysis",
+        action="store_false",
+        help="Call DeepSeek again before regenerating the reports.",
     )
     return parser.parse_args(argv)
 

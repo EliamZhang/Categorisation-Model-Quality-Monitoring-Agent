@@ -154,11 +154,14 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         self.assertEqual(rows, [{"judgment": "illion更准"}])
         self.assertEqual(todos, [{"action": "one"}])
 
-    def test_reuse_ai_analysis_flag_is_enabled(self) -> None:
-        fallback = type("Args", (), {"reuse_ai_analysis": False})()
-        parse_args = getattr(analysis, "parse_args", lambda _args: fallback)
-
-        self.assertTrue(parse_args(["--reuse-ai-analysis"]).reuse_ai_analysis)
+    def test_ai_analysis_is_reused_by_default_with_live_opt_in(self) -> None:
+        self.assertTrue(analysis.parse_args([]).reuse_ai_analysis)
+        self.assertTrue(
+            analysis.parse_args(["--reuse-ai-analysis"]).reuse_ai_analysis
+        )
+        self.assertFalse(
+            analysis.parse_args(["--run-ai-analysis"]).reuse_ai_analysis
+        )
 
 
 if __name__ == "__main__":
