@@ -24,7 +24,7 @@ Reads `classification_report.xlsx` → computes metrics → calls DeepSeek V4 fo
 | | `category_ranking` | Per-illion-category ranking with strict-mismatch finv Top 3 flows |
 | | `illion_only_categories` | Categories illion has while finv is empty, with gap distribution and finv missing rate |
 | | `finv_only_categories` | Categories finv has while illion is empty or `All Other Credits`, with source-state split |
-| | `disagreement_samples` | Sampled rows sent to AI |
+| | `disagreement_samples` | All strict disagreement rows sent to AI |
 | `disagreement_ai_analysis.xlsx` | `ai_row_analysis` | AI judgment per row (who is more accurate) |
 | | `todos` | Actionable fixes for finv, ranked by priority |
 
@@ -59,8 +59,8 @@ the two systems agree do not appear in the flow.
 
 ## AI Analysis Pipeline
 
-1. Sample up to 30 disagreement rows per finv category (590 total across 28 categories)
-2. Send batches of 20 rows to **DeepSeek V4** (`deepseek-chat`) with transaction text, amount, counterparty, and both classifications
+1. Collect **all** strict disagreement rows (both systems classify differently) across all categories (~3,300 rows)
+2. Send batches of 20 rows to **DeepSeek V4** (`deepseek-v4-flash`) with transaction text, amount, counterparty, and both classifications
 3. AI judges each row: `illion更准` / `finv更准` / `都合理` / `都不对` / `不确定`
 4. AI generates prioritized TODOs for finv: knowledge base updates, rule fixes, keyword tuning
 
@@ -93,6 +93,6 @@ Edit constants at the top of `category_quality_analysis.py`:
 
 ```python
 DEEPSEEK_API_KEY = "sk-..."
-DEEPSEEK_MODEL = "deepseek-chat"
-SAMPLE_PER_CATEGORY = 30   # rows sampled per category for AI audit
+DEEPSEEK_MODEL = "deepseek-v4-flash"
+BATCH_SIZE = 20   # rows per API call
 ```

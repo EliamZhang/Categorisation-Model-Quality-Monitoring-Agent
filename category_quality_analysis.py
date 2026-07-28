@@ -61,12 +61,11 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 
-SAMPLE_PER_CATEGORY = 30  # 每个 category 组采样数
 API_RETRY_COUNT = 3
 API_RETRY_DELAY = 5  # seconds
 
-# illion category 中不算"有效覆盖"的值
-ILLION_UNCOVERED_CATS: frozenset[str] = frozenset({"All Other Credits"})
+# illion category 中不再排除任何值 —— "All Other Credits" 现已纳入有效覆盖
+# (finv 也新增了 All Other Credit 分类, 两者可以同台对比)
 AI_JUDGMENT_METRICS = (
     ("illion更准", "ai_illion_better"),
     ("finv更准", "ai_finv_better"),
@@ -122,11 +121,8 @@ def is_effective(series: pd.Series) -> pd.Series:
 
 
 def il_cat_effective(df: pd.DataFrame) -> pd.Series:
-    """illion category 有效: 非空 + 不是 'All Other Credits'."""
-    return (
-        df["category"].notna()
-        & ~df["category"].isin(ILLION_UNCOVERED_CATS)
-    )
+    """illion category 有效: 非空 (All Other Credits 现已纳入)."""
+    return df["category"].notna()
 
 
 def il_tp_effective(df: pd.DataFrame) -> pd.Series:
@@ -327,9 +323,6 @@ def _coverage_gap_distributions(
             "finv有效总数": category_total,
             "illion无效率": round(count / category_total * 100, 1),
             "illion为空": int((category_mask & df["category"].isna()).sum()),
-            "illion为All Other Credits": int(
-                (category_mask & (df["category"] == "All Other Credits")).sum()
-            ),
         })
 
     return illion_rows, finv_rows
@@ -373,24 +366,16 @@ def load_existing_ai_analysis(path: Path) -> tuple[list[dict], list[dict]]:
 # ═══════════════════════════════════════════════════════════════════
 
 def sample_disagreements(df: pd.DataFrame) -> pd.DataFrame:
-    """按 category 组采样不一致行, 返回供 AI 分析的数据集."""
+    """提取全部不一致行, 返回供 AI 分析的数据集."""
     il_eff = il_cat_effective(df)
     fv_eff = fv_cat_effective(df)
     both_eff = il_eff & fv_eff
     disagree_mask = both_eff & (df["category"] != df["finv_category"])
 
-    sampled_rows: list[pd.DataFrame] = []
-
-    for cat_name in sorted(df.loc[disagree_mask, "finv_category"].unique()):
-        group = df[disagree_mask & (df["finv_category"] == cat_name)]
-        n = min(SAMPLE_PER_CATEGORY, len(group))
-        if n > 0:
-            sampled_rows.append(group.sample(n=n, random_state=42))
-
-    if not sampled_rows:
+    result = df[disagree_mask].copy()
+    if result.empty:
         return pd.DataFrame()
 
-    result = pd.concat(sampled_rows, ignore_index=True)
     # 选择 AI 分析需要的列
     ai_cols = [
         "user_id", "application_id", "transaction_date", "amount", "dr_cr",
@@ -622,11 +607,17 @@ def _parse_ai_response(content: str) -> dict | None:
     # 尝试提取 ```json ... ``` 代码块
     if "```json" in content:
         start = content.index("```json") + 7
-        end = content.index("```", start)
+        try:
+            end = content.index("```", start)
+        except ValueError:
+            end = len(content)
         content = content[start:end].strip()
     elif "```" in content:
         start = content.index("```") + 3
-        end = content.index("```", start)
+        try:
+            end = content.index("```", start)
+        except ValueError:
+            end = len(content)
         content = content[start:end].strip()
     try:
         return json.loads(content)
@@ -680,7 +671,7 @@ def _write_summary_sheet(writer, results: dict,
         ["═══ 1. illion 有效覆盖率 ═══"],
         ["illion Category 有效覆盖率",
          f"{results['il_cat_eff_count']:,} / {n:,} = {results['il_cat_eff_pct']}%",
-         "category 非空 且 非 'All Other Credits'"],
+         "category 非空 (All Other Credits 现已纳入有效覆盖)"],
         ["illion Third Party 有效覆盖率",
          f"{results['il_tp_eff_count']:,} / {n:,} = {results['il_tp_eff_pct']}%",
          "third_party 非空 且 ≠ 自己的 category (排除假交易对手)"],
@@ -713,7 +704,7 @@ def _write_summary_sheet(writer, results: dict,
         ["═══ 4. illion Category 为空时 finv 覆盖率 ═══"],
         ["illion Category 为空的行",
          f"{results['il_empty_count']:,}",
-         "illion category 为空 / 为 'All Other Credits'"],
+         "illion category 为空"],
         ["其中 finv 有 Category",
          f"{results['il_empty_fv_coverage_count']:,} / {results['il_empty_count']:,} = {results['il_empty_fv_coverage_pct']}%",
          "illion 缺失时 finv 仍能覆盖的比例"],
@@ -732,7 +723,7 @@ def _write_summary_sheet(writer, results: dict,
          "详见 illion_only_categories：按 illion category 分布"],
         ["finv 有、illion 无有效 Category",
          f"{results['il_empty_fv_coverage_count']:,} / {results['fv_cat_eff_count']:,} = {results['il_empty_fv_coverage_count'] / results['fv_cat_eff_count'] * 100:.2f}%",
-         "详见 finv_only_categories：区分 illion 为空和 All Other Credits"],
+         "详见 finv_only_categories：illion 为空时的 finv 覆盖分布"],
         [""],
         ["═══ 7. Counterparty 对比 ═══"],
         ["双方都有有效 Counterparty",
@@ -994,6 +985,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Reuse disagreement_ai_analysis.xlsx instead of calling DeepSeek.",
     )
+    parser.add_argument(
+        "--skip-ai",
+        action="store_true",
+        help="Skip AI analysis entirely — only compute metrics and rankings.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1031,13 +1027,16 @@ def main() -> None:
               f"({r['不一致率(vs finv有值)']}% vs finv有值)  "
               f"finv不一致Top3: {r['finv不一致Top3类别']}")
 
-    # ── Step 4: Sample disagreements ──
-    print("\n[4/5] Sampling disagreement rows for AI analysis...")
+    # ── Step 4: Collect all disagreements ──
+    print("\n[4/5] Collecting all disagreement rows for AI analysis...")
     sample_df = sample_disagreements(df)
-    print(f"  Sampled {len(sample_df)} rows across {sample_df['finv_category'].nunique()} categories")
+    print(f"  Collected {len(sample_df)} rows across {sample_df['finv_category'].nunique()} categories")
 
     # ── Step 5: AI Analysis ──
-    if args.reuse_ai_analysis:
+    if args.skip_ai:
+        print("\n[5/5] AI analysis skipped (--skip-ai).")
+        row_results, todos = [], []
+    elif args.reuse_ai_analysis:
         print("\n[5/5] Reusing saved AI analysis...")
         row_results, todos = load_existing_ai_analysis(OUTPUT_AI)
         print(f"  Reused {len(row_results)} AI rows and {len(todos)} TODOs")
@@ -1048,7 +1047,10 @@ def main() -> None:
         print(f"  Total rows to analyze: {len(sample_df)}")
         row_results, todos = analyze_disagreements(sample_df)
 
-    ai_metrics = compute_ai_metrics(row_results, todos)
+    if args.skip_ai:
+        ai_metrics = None
+    else:
+        ai_metrics = compute_ai_metrics(row_results, todos)
 
     if row_results:
         print(f"\n  AI Analysis Summary:")
@@ -1060,15 +1062,17 @@ def main() -> None:
         print(f"    errors:     {ai_metrics['ai_failed_count']}")
         print(f"  TODOs generated: {len(todos)}")
 
-    write_ai_analysis_xlsx(row_results, todos, OUTPUT_AI)
-    print(f"  → {OUTPUT_AI.name} written")
+    if not args.skip_ai:
+        write_ai_analysis_xlsx(row_results, todos, OUTPUT_AI)
+        print(f"  → {OUTPUT_AI.name} written")
     write_metrics_xlsx(results, ranking, sample_df, OUTPUT_METRICS, ai_metrics)
     print(f"  → {OUTPUT_METRICS.name} written")
 
     print("\n" + "=" * 60)
     print("  DONE!")
     print(f"  Metrics:  {OUTPUT_METRICS}")
-    print(f"  AI Analysis: {OUTPUT_AI}")
+    if not args.skip_ai:
+        print(f"  AI Analysis: {OUTPUT_AI}")
     print("=" * 60)
 
 

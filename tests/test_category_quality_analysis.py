@@ -54,7 +54,7 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         results = compute_all_metrics(metric_fixture())
 
         self.assertEqual(results["il_has_fv_empty_count"], 2)
-        self.assertEqual(results["il_empty_fv_coverage_count"], 2)
+        self.assertEqual(results["il_empty_fv_coverage_count"], 1)
 
         illion_only = {
             row["illion_category"]: row
@@ -75,9 +75,9 @@ class CategoryQualityMetricsTest(unittest.TestCase):
             row["finv_category"]: row
             for row in results["finv_only_categories"]
         }
-        self.assertEqual(finv_only["Retail"]["缺口数"], 2)
+        self.assertEqual(finv_only["Retail"]["缺口数"], 1)
         self.assertEqual(finv_only["Retail"]["illion为空"], 1)
-        self.assertEqual(finv_only["Retail"]["illion为All Other Credits"], 1)
+        self.assertNotIn("illion为All Other Credits", finv_only["Retail"])
 
     def test_ai_metrics_and_workbook_sections(self) -> None:
         compute_ai_metrics = getattr(
@@ -158,6 +158,10 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         self.assertFalse(analysis.parse_args([]).reuse_ai_analysis)
         self.assertTrue(
             analysis.parse_args(["--reuse-ai-analysis"]).reuse_ai_analysis
+        )
+        self.assertFalse(analysis.parse_args([]).skip_ai)
+        self.assertTrue(
+            analysis.parse_args(["--skip-ai"]).skip_ai
         )
 
 
