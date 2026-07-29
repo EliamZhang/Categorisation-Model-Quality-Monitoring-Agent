@@ -15,7 +15,7 @@ Simplified Category Difference Report
 
 输出 Excel 保留 3 个 Sheet：
 - 00_核心对比：关键指标、逐 Category 优先级分析、主要差异流向
-- 01_热力图：Category 对比数量矩阵及 reference 行占比
+- 01_差异诊断地图：核心诊断指标、Top 差异流向、完整数量矩阵、差异流向占比及申请影响矩阵
 - 03_排查明细：按排查优先级组织不一致和单边缺失交易，默认隐藏次要技术字段
 
 其中“00_核心对比”的第二张表重点回答：
@@ -562,6 +562,20 @@ def compute_summary(df: pd.DataFrame, config: ReportConfig) -> tuple[dict[str, A
         ),
         "reference_unique_categories": int(df["__ref_key"].nunique(dropna=True)),
         "candidate_unique_categories": int(df["__cand_key"].nunique(dropna=True)),
+        "difference_user_count": (
+            int(df.loc[mismatch | ref_only | cand_only, "__user_id_clean"].nunique(dropna=True))
+            if "__user_id_clean" in df.columns else pd.NA
+        ),
+        "difference_application_count": (
+            int(df.loc[mismatch | ref_only | cand_only, "__application_id_clean"].nunique(dropna=True))
+            if "__application_id_clean" in df.columns else pd.NA
+        ),
+        "difference_amount": (
+            float(df.loc[mismatch | ref_only | cand_only, "__abs_amount"].sum(min_count=1))
+            if "__abs_amount" in df.columns
+            and df.loc[mismatch | ref_only | cand_only, "__abs_amount"].notna().any()
+            else pd.NA
+        ),
     }
 
     r = config.reference_label
@@ -870,75 +884,236 @@ def compute_category_comparison(
     return result[columns]
 
 
-def compute_difference_flows(df: pd.DataFrame) -> pd.DataFrame:
+def compute_difference_flows(
+    df: pd.DataFrame,
+    config: ReportConfig,
+    category_comparison: pd.DataFrame,
+) -> pd.DataFrame:
+    """汇总差异流向，并补充用户、申请、金额、交易方向和排查建议。"""
     status = df["__status"].astype("string")
     difference = status.isin(["mismatch", "reference_only", "candidate_only"])
 
-    if not difference.any():
-        return pd.DataFrame(columns=[
-            "排名", "illion Category", "finv Category", "差异类型",
-            "数量", "占全部差异比例", "占illion该Category比例",
-        ])
+    r = config.reference_label
+    c = config.candidate_label
+    ref_col = f"{r} Category"
+    cand_col = f"{c} Category"
+    ref_share_col = f"占{r}该Category比例"
+    ref_diff_share_col = f"占{r}该Category差异比例"
 
-    subset = df.loc[difference, ["__ref_matrix", "__cand_matrix", "__status_cn"]].copy()
-    flows = (
-        subset.groupby(["__ref_matrix", "__cand_matrix", "__status_cn"], dropna=False)
-        .size()
-        .rename("数量")
-        .reset_index()
-        .rename(columns={
-            "__ref_matrix": "illion Category",
-            "__cand_matrix": "finv Category",
-            "__status_cn": "差异类型",
-        })
-    )
+    columns = [
+        "排名", "建议优先级", "是否关键Category", ref_col, cand_col, "差异类型",
+        "数量", "占全部差异比例", ref_share_col, ref_diff_share_col,
+        "影响用户数", "影响申请数", "差异金额", "主要交易方向", "排查建议",
+    ]
+    if not difference.any():
+        return pd.DataFrame(columns=columns)
+
+    group_columns = ["__ref_matrix", "__cand_matrix", "__status", "__status_cn"]
+    subset_columns = list(group_columns)
+    for optional in ["__user_id_clean", "__application_id_clean", "__abs_amount"]:
+        if optional in df.columns:
+            subset_columns.append(optional)
+    if "dr_cr" in df.columns:
+        subset_columns.append("dr_cr")
+
+    subset = df.loc[difference, subset_columns].copy()
+    grouped = subset.groupby(group_columns, dropna=False, sort=False, observed=True)
+    flows = grouped.size().rename("数量").reset_index()
+
+    if "__user_id_clean" in subset.columns:
+        users = grouped["__user_id_clean"].nunique(dropna=True).rename("影响用户数").reset_index()
+        flows = flows.merge(users, on=group_columns, how="left")
+    else:
+        flows["影响用户数"] = pd.NA
+
+    if "__application_id_clean" in subset.columns:
+        applications = (
+            grouped["__application_id_clean"]
+            .nunique(dropna=True)
+            .rename("影响申请数")
+            .reset_index()
+        )
+        flows = flows.merge(applications, on=group_columns, how="left")
+    else:
+        flows["影响申请数"] = pd.NA
+
+    if "__abs_amount" in subset.columns:
+        amounts = grouped["__abs_amount"].sum(min_count=1).rename("差异金额").reset_index()
+        flows = flows.merge(amounts, on=group_columns, how="left")
+    else:
+        flows["差异金额"] = pd.NA
+
+    if "dr_cr" in subset.columns:
+        directions = (
+            grouped["dr_cr"]
+            .agg(lambda values: top_category_text(clean_series(values), top_n=2))
+            .rename("主要交易方向")
+            .reset_index()
+        )
+        flows = flows.merge(directions, on=group_columns, how="left")
+    else:
+        flows["主要交易方向"] = "-"
+
+    flows = flows.rename(columns={
+        "__ref_matrix": ref_col,
+        "__cand_matrix": cand_col,
+        "__status_cn": "差异类型",
+    })
 
     total_difference = int(flows["数量"].sum())
-    ref_total = (
-        df.loc[df["__ref_matrix"].ne(EMPTY_LABEL), "__ref_matrix"]
+    ref_total = df.loc[df["__ref_matrix"].ne(EMPTY_LABEL), "__ref_matrix"].value_counts(dropna=False)
+    ref_difference_total = (
+        df.loc[difference & df["__ref_matrix"].ne(EMPTY_LABEL), "__ref_matrix"]
         .value_counts(dropna=False)
     )
 
     flows["占全部差异比例"] = flows["数量"] / total_difference
-    flows["占illion该Category比例"] = flows.apply(
-        lambda row: safe_div(
-            row["数量"],
-            ref_total.get(row["illion Category"], 0),
-        ) if row["illion Category"] != EMPTY_LABEL else pd.NA,
+    flows[ref_share_col] = flows.apply(
+        lambda row: safe_div(row["数量"], ref_total.get(row[ref_col], 0))
+        if row[ref_col] != EMPTY_LABEL else pd.NA,
+        axis=1,
+    )
+    flows[ref_diff_share_col] = flows.apply(
+        lambda row: safe_div(row["数量"], ref_difference_total.get(row[ref_col], 0))
+        if row[ref_col] != EMPTY_LABEL else pd.NA,
         axis=1,
     )
 
-    flows = flows.sort_values("数量", ascending=False).reset_index(drop=True)
+    priority_map: dict[str, str] = {}
+    if {"Category", "建议优先级"}.issubset(category_comparison.columns):
+        priority_map = (
+            category_comparison[["Category", "建议优先级"]]
+            .drop_duplicates("Category")
+            .set_index("Category")["建议优先级"]
+            .astype(str)
+            .to_dict()
+        )
+
+    key_mask = flows.apply(
+        lambda row: (
+            row[ref_col] != EMPTY_LABEL
+            and is_key_category(str(row[ref_col]), config.key_category_keywords)
+        ) or (
+            row[cand_col] != EMPTY_LABEL
+            and is_key_category(str(row[cand_col]), config.key_category_keywords)
+        ),
+        axis=1,
+    )
+    flows["是否关键Category"] = np.where(key_mask, "是", "否")
+    flows["建议优先级"] = flows[ref_col].map(priority_map).fillna("P3").astype(str)
+    candidate_only_key = flows["__status"].eq("candidate_only") & key_mask
+    flows.loc[candidate_only_key & flows["建议优先级"].eq("P3"), "建议优先级"] = "P2"
+    flows["建议优先级"] = flows["建议优先级"].where(
+        flows["建议优先级"].isin(DETAIL_PRIORITY_ORDER), "P3"
+    )
+
+    def investigation_action(row: pd.Series) -> str:
+        flow_status = str(row["__status"])
+        if flow_status == "reference_only":
+            return f"检查{c}漏识别：文本清洗、商户覆盖、别名和兜底规则"
+        if flow_status == "candidate_only":
+            return f"核验{c}新增识别是否合理，并确认{r}是否存在漏标"
+        return "检查分类边界、关键词/规则优先级及商户知识库"
+
+    flows["排查建议"] = flows.apply(investigation_action, axis=1)
+    priority_rank = flows["建议优先级"].map({"P1": 0, "P2": 1, "P3": 2}).fillna(3)
+    flows = (
+        flows.assign(__priority_rank=priority_rank)
+        .sort_values(
+            ["__priority_rank", "数量", "影响申请数", "差异金额"],
+            ascending=[True, False, False, False],
+            kind="stable",
+            na_position="last",
+        )
+        .drop(columns=["__priority_rank", "__status"])
+        .reset_index(drop=True)
+    )
     flows.insert(0, "排名", np.arange(1, len(flows) + 1))
-    return flows
+    return flows[columns]
 
 
-def compute_matrices(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    # 双方均为空没有比较价值，因此不进入矩阵
+def build_matrix_category_order(
+    counts: pd.DataFrame,
+    category_comparison: pd.DataFrame,
+    config: ReportConfig,
+) -> list[str]:
+    """生成行列统一的 Category 顺序：优先级、关键类别、差异影响、支持度。"""
+    categories = set(counts.index.astype(str)) | set(counts.columns.astype(str))
+    if not categories:
+        return []
+
+    comparison = category_comparison.copy()
+    if comparison.empty or "Category" not in comparison.columns:
+        ordered = sorted(categories, key=lambda value: value.casefold())
+        return [value for value in ordered if value != EMPTY_LABEL] + (
+            [EMPTY_LABEL] if EMPTY_LABEL in ordered else []
+        )
+
+    r = config.reference_label
+    difference_count_col = f"{r}侧差异数"
+    support_col = f"{r}数量"
+    lookup = comparison.drop_duplicates("Category").set_index("Category")
+
+    def sort_key(category: str) -> tuple[Any, ...]:
+        if category == EMPTY_LABEL:
+            return (9, 9, 0.0, 0.0, category.casefold())
+        if category in lookup.index:
+            row = lookup.loc[category]
+            priority = {"P1": 0, "P2": 1, "P3": 2}.get(str(row.get("建议优先级", "P3")), 3)
+            key_rank = 0 if str(row.get("关键Category", "否")) == "是" else 1
+            difference_count = float(row.get(difference_count_col, 0) or 0)
+            support = float(row.get(support_col, 0) or 0)
+            return (priority, key_rank, -difference_count, -support, category.casefold())
+        support = float(counts.reindex(index=[category], fill_value=0).sum(axis=1).iloc[0])
+        support += float(counts.reindex(columns=[category], fill_value=0).sum(axis=0).iloc[0])
+        return (3, 1, 0.0, -support, category.casefold())
+
+    return sorted(categories, key=sort_key)
+
+
+def compute_matrices(
+    df: pd.DataFrame,
+    category_comparison: pd.DataFrame,
+    config: ReportConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """生成完整数量、仅差异行占比、差异影响申请数三类矩阵。"""
     matrix_source = df.loc[
         ~(df["__ref_matrix"].eq(EMPTY_LABEL) & df["__cand_matrix"].eq(EMPTY_LABEL))
     ]
-
     if matrix_source.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    counts = pd.crosstab(
+    raw_counts = pd.crosstab(
         matrix_source["__ref_matrix"],
         matrix_source["__cand_matrix"],
         dropna=False,
     ).astype(int)
+    order = build_matrix_category_order(raw_counts, category_comparison, config)
+    counts = raw_counts.reindex(index=order, columns=order, fill_value=0)
 
-    # 按illion和finv支持度排序；空值固定放最后
-    row_order = list(counts.sum(axis=1).sort_values(ascending=False).index)
-    col_order = list(counts.sum(axis=0).sort_values(ascending=False).index)
-    if EMPTY_LABEL in row_order:
-        row_order = [x for x in row_order if x != EMPTY_LABEL] + [EMPTY_LABEL]
-    if EMPTY_LABEL in col_order:
-        col_order = [x for x in col_order if x != EMPTY_LABEL] + [EMPTY_LABEL]
+    difference_counts = counts.copy()
+    for category in order:
+        if category in difference_counts.index and category in difference_counts.columns:
+            difference_counts.loc[category, category] = 0
+    difference_row_pct = difference_counts.div(
+        difference_counts.sum(axis=1).replace(0, np.nan), axis=0
+    ).fillna(0.0)
 
-    counts = counts.loc[row_order, col_order]
-    row_pct = counts.div(counts.sum(axis=1).replace(0, np.nan), axis=0).fillna(0.0)
-    return counts, row_pct
+    application_matrix = pd.DataFrame()
+    if "__application_id_clean" in matrix_source.columns:
+        difference_source = matrix_source.loc[
+            matrix_source["__ref_matrix"].ne(matrix_source["__cand_matrix"])
+        ]
+        if not difference_source.empty:
+            application_matrix = (
+                difference_source.groupby(["__ref_matrix", "__cand_matrix"], dropna=False)["__application_id_clean"]
+                .nunique(dropna=True)
+                .unstack(fill_value=0)
+                .reindex(index=order, columns=order, fill_value=0)
+                .astype(int)
+            )
+
+    return counts, difference_row_pct, application_matrix
 
 
 def build_difference_details(
@@ -1318,60 +1493,324 @@ def apply_priority_fill(ws, header_row: int, data_rows: int) -> None:
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
+def write_kpi_cards(
+    ws,
+    start_row: int,
+    metrics: Sequence[tuple[str, Any, str, str]],
+    cards_per_row: int = 4,
+) -> int:
+    """写入紧凑 KPI 卡片，返回卡片区域最后一行。"""
+    card_width = 4
+    for idx, (label, value, number_format, note) in enumerate(metrics):
+        card_row = start_row + (idx // cards_per_row) * 3
+        card_col = 1 + (idx % cards_per_row) * card_width
+        end_col = card_col + card_width - 2
+
+        ws.merge_cells(start_row=card_row, start_column=card_col, end_row=card_row, end_column=end_col)
+        label_cell = ws.cell(card_row, card_col, label)
+        label_cell.fill = PatternFill("solid", fgColor=BLUE)
+        label_cell.font = Font(size=10, bold=True, color=WHITE)
+        label_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        ws.merge_cells(start_row=card_row + 1, start_column=card_col, end_row=card_row + 1, end_column=end_col)
+        value_cell = ws.cell(card_row + 1, card_col, value if not pd.isna(value) else "-")
+        value_cell.fill = PatternFill("solid", fgColor=LIGHT_BLUE)
+        value_cell.font = Font(size=15, bold=True, color=NAVY)
+        value_cell.alignment = Alignment(horizontal="center", vertical="center")
+        if not pd.isna(value):
+            value_cell.number_format = number_format
+
+        ws.cell(card_row + 2, card_col, note)
+        ws.merge_cells(start_row=card_row + 2, start_column=card_col, end_row=card_row + 2, end_column=end_col)
+        note_cell = ws.cell(card_row + 2, card_col)
+        note_cell.font = Font(size=9, color=GRAY)
+        note_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        for row in range(card_row, card_row + 3):
+            for col in range(card_col, end_col + 1):
+                ws.cell(row, col).border = BORDER
+
+    row_count = (len(metrics) + cards_per_row - 1) // cards_per_row
+    return start_row + row_count * 3 - 1
+
+
+def style_flow_table(ws, header_row: int, data_rows: int) -> None:
+    if data_rows <= 0:
+        return
+    format_dataframe_region(ws, header_row, data_rows)
+    apply_count_data_bar(ws, header_row, data_rows, ["数量", "影响用户数", "影响申请数", "差异金额"])
+    apply_difference_rate_color_scale(
+        ws,
+        header_row,
+        data_rows,
+        [header for header in [
+            "占全部差异比例",
+            next((str(ws.cell(header_row, c).value) for c in range(1, ws.max_column + 1)
+                  if str(ws.cell(header_row, c).value).endswith("该Category比例")), ""),
+        ] if header],
+    )
+
+    header_map = {
+        str(ws.cell(header_row, col).value): col
+        for col in range(1, ws.max_column + 1)
+        if ws.cell(header_row, col).value is not None
+    }
+    priority_col = header_map.get("建议优先级")
+    key_col = header_map.get("是否关键Category")
+    for row in range(header_row + 1, header_row + data_rows + 1):
+        if priority_col:
+            cell = ws.cell(row, priority_col)
+            fill = {"P1": LIGHT_RED, "P2": LIGHT_YELLOW, "P3": LIGHT_GREEN}.get(cell.value, WHITE)
+            cell.fill = PatternFill("solid", fgColor=fill)
+            cell.font = Font(bold=True, color=RED if cell.value == "P1" else BLACK)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        if key_col and ws.cell(row, key_col).value == "是":
+            cell = ws.cell(row, key_col)
+            cell.fill = PatternFill("solid", fgColor=LIGHT_BLUE)
+            cell.font = Font(bold=True, color=NAVY)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+
+def write_matrix_section(
+    writer: pd.ExcelWriter,
+    ws,
+    sheet_name: str,
+    matrix: pd.DataFrame,
+    section_row: int,
+    title: str,
+    index_title: str,
+    percent: bool,
+    mode: str,
+) -> int:
+    """写入一个矩阵区域，返回区域最后一行。"""
+    end_col = max(2, matrix.shape[1] + 1)
+    style_section_title(ws, section_row, title, end_col)
+    if matrix.empty:
+        ws.cell(section_row + 1, 1, "无可用数据")
+        ws.cell(section_row + 1, 1).font = Font(italic=True, color=GRAY)
+        return section_row + 1
+
+    output = matrix.copy()
+    output.index.name = index_title
+    output.to_excel(writer, sheet_name=sheet_name, startrow=section_row)
+    header_row = section_row + 1
+    data_start = header_row + 1
+    data_end = data_start + len(output) - 1
+    style_header(ws, header_row)
+    _apply_diagnostic_matrix_format(
+        ws,
+        matrix=output,
+        header_row=header_row,
+        data_start=data_start,
+        data_end=data_end,
+        percent=percent,
+        mode=mode,
+    )
+    return data_end
+
+
+def _apply_diagnostic_matrix_format(
+    ws,
+    matrix: pd.DataFrame,
+    header_row: int,
+    data_start: int,
+    data_end: int,
+    percent: bool,
+    mode: str,
+) -> None:
+    """区别处理一致、分类冲突和单边缺失，不让一致单元格掩盖问题。"""
+    if matrix.empty:
+        return
+
+    positive_off_diagonal: list[float] = []
+    for row_category in matrix.index:
+        for col_category in matrix.columns:
+            value = matrix.loc[row_category, col_category]
+            if (
+                row_category != col_category
+                and row_category != EMPTY_LABEL
+                and col_category != EMPTY_LABEL
+                and pd.notna(value)
+                and float(value) > 0
+            ):
+                positive_off_diagonal.append(float(value))
+    medium_cutoff = float(np.median(positive_off_diagonal)) if positive_off_diagonal else 0.0
+    high_cutoff = float(np.quantile(positive_off_diagonal, 0.75)) if positive_off_diagonal else 0.0
+
+    number_format = "0.0%" if percent else "#,##0"
+    for row_offset, row_category in enumerate(matrix.index):
+        excel_row = data_start + row_offset
+        row_label = ws.cell(excel_row, 1)
+        row_label.border = BORDER
+        row_label.alignment = Alignment(vertical="center", wrap_text=True)
+        if row_category == EMPTY_LABEL:
+            row_label.fill = PatternFill("solid", fgColor=LIGHT_ORANGE)
+            row_label.font = Font(bold=True, color=ORANGE)
+
+        for col_offset, col_category in enumerate(matrix.columns, start=2):
+            cell = ws.cell(excel_row, col_offset)
+            value = matrix.loc[row_category, col_category]
+            numeric_value = 0.0 if pd.isna(value) else float(value)
+            cell.border = BORDER
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.number_format = number_format
+
+            if numeric_value == 0:
+                cell.value = None
+                cell.fill = PatternFill("solid", fgColor=WHITE)
+                continue
+
+            if row_category == col_category and row_category != EMPTY_LABEL:
+                if mode == "full_count":
+                    cell.fill = PatternFill("solid", fgColor=LIGHT_GREEN)
+                    cell.font = Font(bold=True, color=GREEN)
+                else:
+                    cell.value = None
+                    cell.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+                continue
+
+            if row_category == EMPTY_LABEL or col_category == EMPTY_LABEL:
+                cell.fill = PatternFill("solid", fgColor=LIGHT_ORANGE)
+                cell.font = Font(bold=True, color=ORANGE)
+                continue
+
+            if numeric_value >= high_cutoff and high_cutoff > 0:
+                fill_color = LIGHT_RED
+                font_color = RED
+            elif numeric_value >= medium_cutoff and medium_cutoff > 0:
+                fill_color = LIGHT_YELLOW
+                font_color = BLACK
+            else:
+                fill_color = LIGHT_ORANGE
+                font_color = BLACK
+            cell.fill = PatternFill("solid", fgColor=fill_color)
+            cell.font = Font(bold=True, color=font_color)
+
+    for col in range(2, matrix.shape[1] + 2):
+        header = ws.cell(header_row, col)
+        if header.value == EMPTY_LABEL:
+            header.fill = PatternFill("solid", fgColor=ORANGE)
+
+
 def write_heatmap_sheet(
     writer: pd.ExcelWriter,
     sheet_name: str,
+    summary: Mapping[str, Any],
+    category_comparison: pd.DataFrame,
+    difference_flows: pd.DataFrame,
     count_matrix: pd.DataFrame,
-    row_pct_matrix: pd.DataFrame,
+    difference_row_pct_matrix: pd.DataFrame,
+    application_matrix: pd.DataFrame,
+    config: ReportConfig,
 ) -> None:
-    """Write a single sheet with two heatmaps: count (top) and row% (bottom)."""
+    """生成面向业务排查的差异诊断地图。"""
     ws = writer.book.create_sheet(sheet_name)
+    r = config.reference_label
+    c = config.candidate_label
+    end_col = max(
+        16,
+        len(difference_flows.columns),
+        count_matrix.shape[1] + 1,
+        difference_row_pct_matrix.shape[1] + 1,
+        application_matrix.shape[1] + 1 if not application_matrix.empty else 0,
+    )
+    subtitle = (
+        f"{r} vs {c} | 绿色=一致，红色=分类冲突，橙色=单边缺失；"
+        "差异流向占比仅使用非一致样本计算"
+    )
+    style_title(ws, "Category 差异诊断地图", subtitle, end_col=end_col)
+    ws.sheet_view.showGridLines = False
+    ws.sheet_view.zoomScale = 85
 
-    # ── Count matrix ───────────────────────────────────────────────
-    count = count_matrix.copy()
-    count.index.name = "illion Category \\ finv Category"
-    count.to_excel(writer, sheet_name=sheet_name, startrow=2)
-    style_title(ws, "Category 对比热力图", "上方: 数量 | 下方: 行占比")
-    style_header(ws, 3)
+    top5_contribution = (
+        float(difference_flows.head(5)["占全部差异比例"].sum())
+        if not difference_flows.empty else 0.0
+    )
+    metrics = [
+        ("Category差异总数", summary.get("all_difference_count", 0), "#,##0", "分类冲突 + 单边缺失"),
+        ("整体差异率", summary.get("all_difference_rate_vs_union", 0.0), "0.00%", "分母为两侧至少一侧有分类"),
+        ("影响申请数", summary.get("difference_application_count", pd.NA), "#,##0", "至少包含一笔差异交易的申请"),
+        ("差异交易金额", summary.get("difference_amount", pd.NA), "#,##0.00", "按交易金额绝对值汇总"),
+        ("Top 5流向贡献", top5_contribution, "0.00%", "前五个差异流向占全部差异"),
+        (f"{c}漏识别", summary.get("reference_only_count", 0), "#,##0", f"仅{r}有Category"),
+        (f"{c}新增识别", summary.get("candidate_only_count", 0), "#,##0", f"仅{c}有Category"),
+        ("影响用户数", summary.get("difference_user_count", pd.NA), "#,##0", "至少包含一笔差异交易的用户"),
+    ]
+    kpi_end = write_kpi_cards(ws, 4, metrics, cards_per_row=4)
 
-    _apply_heatmap_format(ws, header_row=3, data_start=4, percent=False)
-    count_end = ws.max_row + 2  # 2 blank rows
+    row = kpi_end + 2
+    top_flows = difference_flows.head(config.top_n).copy()
+    style_section_title(
+        ws,
+        row,
+        f"1. Top {min(config.top_n, len(top_flows))} 差异流向（按优先级及影响排序）",
+        max(1, len(top_flows.columns)),
+    )
+    flow_header = row + 1
+    top_flows.to_excel(writer, sheet_name=sheet_name, index=False, startrow=flow_header - 1)
+    style_header(ws, flow_header)
+    style_flow_table(ws, flow_header, len(top_flows))
+    if len(top_flows) > 0:
+        ws.auto_filter.ref = f"A{flow_header}:{get_column_letter(len(top_flows.columns))}{flow_header + len(top_flows)}"
+    row = flow_header + len(top_flows) + 2
 
-    # ── Row % matrix ───────────────────────────────────────────────
-    row_pct = row_pct_matrix.copy()
-    row_pct.index.name = "illion Category \\ finv Category"
-    row_pct_start = count_end
-    style_section_title(ws, row_pct_start, "行占比（每个illion Category 的finv流向，行合计 100%）", count_matrix.shape[1] + 1)
-    row_pct.to_excel(writer, sheet_name=sheet_name, startrow=row_pct_start + 1)
-    style_header(ws, row_pct_start + 2)
+    matrix_index_title = f"{r} Category \\ {c} Category"
+    row = write_matrix_section(
+        writer,
+        ws,
+        sheet_name,
+        count_matrix,
+        row,
+        "2. 完整数量矩阵（对角线为一致；非对角线为差异）",
+        matrix_index_title,
+        percent=False,
+        mode="full_count",
+    ) + 2
 
-    _apply_heatmap_format(ws, header_row=row_pct_start + 2, data_start=row_pct_start + 3, percent=True)
+    row = write_matrix_section(
+        writer,
+        ws,
+        sheet_name,
+        difference_row_pct_matrix,
+        row,
+        f"3. 差异流向占比矩阵（每个{r} Category发生差异时流向哪里；行合计100%）",
+        matrix_index_title,
+        percent=True,
+        mode="difference_share",
+    ) + 2
 
+    write_matrix_section(
+        writer,
+        ws,
+        sheet_name,
+        application_matrix,
+        row,
+        "4. 差异影响申请数矩阵（同一申请在同一流向内去重）",
+        matrix_index_title,
+        percent=False,
+        mode="application",
+    )
+
+    ws.freeze_panes = "A12"
+    ws.sheet_properties.tabColor = RED
     ws.column_dimensions["A"].width = 34
-    for col in range(2, ws.max_column + 1):
-        ws.column_dimensions[get_column_letter(col)].width = 16
+    for col in range(2, max(2, ws.max_column) + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 15
 
-
-def _apply_heatmap_format(ws, header_row: int, data_start: int, percent: bool) -> None:
-    if ws.max_row >= data_start and ws.max_column >= 2:
-        start = ws.cell(data_start, 2).coordinate
-        end = ws.cell(ws.max_row, ws.max_column).coordinate
-        ws.conditional_formatting.add(
-            f"{start}:{end}",
-            ColorScaleRule(
-                start_type="min", start_color=WHITE,
-                mid_type="percentile", mid_value=50, mid_color=LIGHT_YELLOW,
-                end_type="max", end_color=RED,
-            ),
-        )
-        number_format = "0.0%" if percent else "#,##0"
-        for row in ws.iter_rows(min_row=data_start):
-            for cell in row:
-                if cell.value is not None:
-                    cell.border = BORDER
-                if cell.column > 1:
-                    cell.number_format = number_format
-                    cell.alignment = Alignment(horizontal="center", vertical="center")
+    set_widths(ws, {
+        "排名": 8,
+        "建议优先级": 12,
+        "是否关键Category": 16,
+        f"{r} Category": 28,
+        f"{c} Category": 28,
+        "差异类型": 20,
+        "数量": 12,
+        "影响用户数": 14,
+        "影响申请数": 14,
+        "差异金额": 16,
+        "主要交易方向": 20,
+        "排查建议": 48,
+    }, max_width=48)
 
 
 def style_detail_header(ws, row: int, config: ReportConfig) -> None:
@@ -1666,8 +2105,8 @@ def write_core_sheet(
         ref_amount_col: 16,
         cand_amount_col: 16,
         "差异交易金额": 18,
-        "illion Category": 28,
-        "finv Category": 28,
+        f"{config.reference_label} Category": 28,
+        f"{config.candidate_label} Category": 28,
         "差异类型": 20,
     })
 
@@ -1738,11 +2177,13 @@ def write_detail_sheet(
 
 def write_report(
     config: ReportConfig,
+    summary: Mapping[str, Any],
     summary_table: pd.DataFrame,
     category_comparison: pd.DataFrame,
     difference_flows: pd.DataFrame,
     count_matrix: pd.DataFrame,
-    row_pct_matrix: pd.DataFrame,
+    difference_row_pct_matrix: pd.DataFrame,
+    application_matrix: pd.DataFrame,
     details: pd.DataFrame,
 ) -> bool:
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1756,13 +2197,18 @@ def write_report(
             config,
         )
 
+        diagnostic_sheet_name = "01_差异诊断地图"
         write_heatmap_sheet(
             writer,
-            "01_热力图",
+            diagnostic_sheet_name,
+            summary,
+            category_comparison,
+            difference_flows,
             count_matrix,
-            row_pct_matrix,
+            difference_row_pct_matrix,
+            application_matrix,
+            config,
         )
-        writer.book["01_热力图"].sheet_properties.tabColor = RED
 
         truncated = write_detail_sheet(writer, details, config)
 
@@ -1910,10 +2356,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     print("[3/6] Computing core metrics and Category-level differences...")
     summary, summary_table = compute_summary(prepared_df, config)
     category_comparison = compute_category_comparison(prepared_df, display_map, config)
-    difference_flows = compute_difference_flows(prepared_df)
+    difference_flows = compute_difference_flows(prepared_df, config, category_comparison)
 
-    print("[4/6] Building heatmaps...")
-    count_matrix, row_pct_matrix = compute_matrices(prepared_df)
+    print("[4/6] Building diagnostic matrices...")
+    count_matrix, difference_row_pct_matrix, application_matrix = compute_matrices(
+        prepared_df, category_comparison, config
+    )
 
     print("[5/6] Building difference details...")
     details = build_difference_details(prepared_df, category_comparison, config)
@@ -1921,11 +2369,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     print("[6/6] Writing simplified Excel report...")
     truncated = write_report(
         config,
+        summary,
         summary_table,
         category_comparison,
         difference_flows,
         count_matrix,
-        row_pct_matrix,
+        difference_row_pct_matrix,
+        application_matrix,
         details,
     )
 

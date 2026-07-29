@@ -69,16 +69,20 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         self.assertEqual(external["finv缺失"], 1)
 
     def test_matrices_row_pct(self) -> None:
-        df, _ = prepare_comparison_data(metric_fixture(), make_config())
-        _, row_pct = compute_matrices(df)
-        self.assertAlmostEqual(row_pct.loc["External Transfers", "External Transfers"], 0.25)
-        self.assertAlmostEqual(row_pct.loc["External Transfers", "Internal Transfer"], 0.25)
-        self.assertAlmostEqual(row_pct.loc["External Transfers", "Credit Card Repayments"], 0.25)
-        self.assertAlmostEqual(row_pct.loc["External Transfers", "(空)"], 0.25)
+        config = make_config()
+        df, display_map = prepare_comparison_data(metric_fixture(), config)
+        category_comparison = compute_category_comparison(df, display_map, config)
+        _, difference_row_pct, _ = compute_matrices(df, category_comparison, config)
+        self.assertAlmostEqual(difference_row_pct.loc["External Transfers", "External Transfers"], 0.0)
+        self.assertAlmostEqual(difference_row_pct.loc["External Transfers", "Internal Transfer"], 1/3)
+        self.assertAlmostEqual(difference_row_pct.loc["External Transfers", "Credit Card Repayments"], 1/3)
+        self.assertAlmostEqual(difference_row_pct.loc["External Transfers", "(空)"], 1/3)
 
     def test_difference_flows(self) -> None:
-        df, _ = prepare_comparison_data(metric_fixture(), make_config())
-        flows = compute_difference_flows(df)
+        config = make_config()
+        df, display_map = prepare_comparison_data(metric_fixture(), config)
+        category_comparison = compute_category_comparison(df, display_map, config)
+        flows = compute_difference_flows(df, config, category_comparison)
         self.assertFalse(flows.empty)
         self.assertIn("数量", flows.columns)
 
@@ -90,17 +94,20 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         df, display_map = prepare_comparison_data(metric_fixture(), config)
         summary, summary_table = compute_summary(df, config)
         category_comparison = compute_category_comparison(df, display_map, config)
-        difference_flows = compute_difference_flows(df)
-        count_matrix, row_pct_matrix = compute_matrices(df)
+        difference_flows = compute_difference_flows(df, config, category_comparison)
+        count_matrix, difference_row_pct_matrix, application_matrix = compute_matrices(
+            df, category_comparison, config
+        )
         details = build_difference_details(df, category_comparison, config)
 
         write_report(
-            config, summary_table, category_comparison,
-            difference_flows, count_matrix, row_pct_matrix, details,
+            config, summary, summary_table, category_comparison,
+            difference_flows, count_matrix, difference_row_pct_matrix,
+            application_matrix, details,
         )
 
         wb = openpyxl.load_workbook(output, data_only=False)
-        expected = {"00_核心对比", "01_热力图", "03_排查明细"}
+        expected = {"00_核心对比", "01_差异诊断地图", "03_排查明细"}
         self.assertTrue(expected.issubset(set(wb.sheetnames)))
 
     def test_summary_has_expected_keys(self) -> None:
