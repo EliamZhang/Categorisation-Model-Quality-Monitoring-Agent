@@ -1,74 +1,67 @@
-# Category Quality Assessment
+# Category Model Quality Monitoring
 
-Compare **finv** (internal) vs **illion** (external reference) transaction classification quality.
+比较 **illion**（外部基准）与 **finv**（内部模型）的交易分类差异。
 
-## Quick Start
+## 快速开始
 
 ```bash
+pip install pandas openpyxl python-calamine
 python category_quality_metrics.py
 ```
 
-Reads `classification_report.xlsx` → computes metrics → writes `category_quality_report.xlsx`.
+读取 `classification_report.xlsx` → 输出 `category_difference_report.xlsx`。
 
-## Input
+## 输入
 
-| File | Sheet | Key Columns |
+| 文件 | Sheet | 必要字段 |
 |---|---|---|
-| `classification_report.xlsx` | `transactions` | `category`, `third_party` (illion) / `finv_category`, `counterparty` (finv) |
+| `classification_report.xlsx` | `transactions` | `category` (illion), `finv_category` (finv) |
 
-## Output Sheets
+## 输出（3 个 Sheet）
 
-| Sheet | Description |
+| Sheet | 内容 |
 |---|---|
-| `00_dashboard` | Dashboard with core metrics, top mismatch categories, top disagreement flows |
-| `01_metric_dictionary` | Metric definitions and interpretation notes |
-| `02_summary` | All metrics in one table with numerator/denominator |
-| `03_category_performance` | Per-category Precision/Recall/F1 vs reference |
-| `04_confusion_pairs` | Main category disagreement flows |
-| `05_confusion_count` | Confusion matrix — counts |
-| `06_confusion_row_pct` | Confusion matrix — row % (reference category flow) |
-| `07_confusion_col_pct` | Confusion matrix — column % (candidate category source) |
-| `08_coverage_gaps` | One-sided category coverage gaps |
-| `09_counterparty_coverage` | Counterparty coverage (coverage only, no matching) |
-| `10_segment_analysis` | Metrics by segment (dr_cr, engine, amount band, etc.) |
-| `11_status_distribution` | Category comparison status distribution |
-| `12_data_quality` | Data quality checks (duplicates, empty tokens, cleaning changes) |
-| `12b_missing_patterns` | Field availability pattern combinations |
-| `12c_category_variants` | Raw text variants that normalize to the same category key |
-| `13_disagreement_details` | All disagreement and coverage gap rows |
-| `14_qa_sample` | QA samples by confusion pair |
-| `15_all_comparisons` | Full transaction-level comparison |
+| `00_核心对比` | 核心指标、逐 Category 差异、全量差异流向 |
+| `01_热力图` | 上半部分数量矩阵、下半部分行占比矩阵（彩色热力图） |
+| `03_差异明细` | 不一致或单边缺失的完整交易明细 |
 
-## CLI Options
+## 命令行参数
 
 ```
---input                          Input Excel path (default: classification_report.xlsx)
---output                         Output Excel path (default: category_quality_report.xlsx)
---sheet                          Input sheet name (default: transactions)
---reference-category             Reference category column (default: category)
---candidate-category             Candidate category column (default: finv_category)
---reference-counterparty         Reference counterparty column (default: third_party)
---candidate-counterparty         Candidate counterparty column (default: counterparty)
---reference-label                Reference system label (default: illion)
---candidate-label                Candidate system label (default: finv)
---alias-json                     Optional category alias mapping JSON
---top-n                          Top N for charts (default: 20)
---segment-columns                Comma-separated segment columns
---detail-columns                 Comma-separated detail columns
+--input              输入 Excel 路径（默认: classification_report.xlsx）
+--output             输出 Excel 路径（默认: category_difference_report.xlsx）
+--sheet              输入 Sheet 名（默认: transactions）
+--reference-category  illion Category 字段名（默认: category）
+--candidate-category  finv Category 字段名（默认: finv_category）
+--reference-label     illion 显示名称（默认: illion）
+--candidate-label     finv 显示名称（默认: finv）
+--alias-json          Category 别名映射 JSON（可选）
+--detail-columns      差异明细输出字段，逗号分隔（默认使用内置字段列表）
+--max-detail-rows     差异明细最大行数（默认: 全部）
 ```
 
-## Key Metrics
+## 指标说明
 
-### Effective Counterparty Coverage
+本报告不使用 Accuracy / F1 / Kappa 等容易被误解的指标，因为 illion 并非人工真值。
 
-illion `third_party` often equals its own `category` (e.g. `category="Groceries"`, `third_party="Groceries"`) — these rows are considered "polluted" and excluded from effective coverage.
+| 指标 | 说明 |
+|---|---|
+| Category 覆盖率 | 该侧有分类值的行占比 |
+| 双方非空时一致率 | 两边都有分类值且一致的比例 |
+| 分类不一致 | 两边都有分类值但不一致 |
+| 仅 illion 有分类 | illion 有值、finv 无值 |
+| 仅 finv 有分类 | finv 有值、illion 无值 |
+| 总差异 | 以上三类差异之和 |
 
-### Category Agreement
+## Category 标准化
 
-- **Joint agreement**: both systems have a category and they match (after normalization)
-- **Coverage-adjusted agreement**: matches / rows where at least one system has a category
-- **Cohen's Kappa / Multiclass MCC**: chance-corrected agreement measures
+比对前会自动处理：
+- Unicode NFKC 标准化（全角→半角、特殊符号规范化）
+- 空白字符清理
+- 空值标记统一（空字符串、`nan`、`null`、`NA` 等 → `(空)`）
+- 可选别名映射（通过 `--alias-json` 指定，将同义分类统一为同一个 key）
 
-### Directional Metrics (Precision / Recall / F1)
+## 依赖
 
-Computed with illion as pseudo-reference. These measure consistency with illion, not ground-truth accuracy.
+- Python 3.11+
+- pandas + openpyxl + python-calamine
