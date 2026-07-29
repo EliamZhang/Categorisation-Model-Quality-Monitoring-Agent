@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 # ═══════════════════════════════════════════════════════════════════
@@ -195,6 +196,7 @@ def compute_all_metrics(df: pd.DataFrame) -> dict[str, Any]:
         results["illion_only_categories"],
         results["finv_only_categories"],
     ) = _coverage_gap_distributions(df, il_cat_eff, fv_cat_eff)
+    results["category_heatmaps"] = _category_heatmap_tables(df)
 
     # ── extras: counterparty 相关 ──
     cp_both = fv_tp_eff & il_tp_eff
@@ -213,6 +215,71 @@ def compute_all_metrics(df: pd.DataFrame) -> dict[str, Any]:
         results["cp_exact_match_pct"] = 0.0
 
     return results
+
+
+def _category_heatmap_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    heatmap_df = df[["category", "finv_category"]].copy()
+    heatmap_df["category"] = heatmap_df["category"].fillna("(illion为空)")
+    heatmap_df["finv_category"] = heatmap_df["finv_category"].fillna("(finv为空)")
+    heatmap_df["__count"] = 1
+
+    counts = pd.pivot_table(
+        heatmap_df,
+        values="__count",
+        index="category",
+        columns="finv_category",
+        aggfunc="sum",
+        fill_value=0,
+    ).astype(int)
+    counts = _sort_heatmap_axes(counts)
+
+    row_totals = counts.sum(axis=1).replace(0, pd.NA)
+    row_pct = counts.div(row_totals, axis=0).mul(100).fillna(0).round(1)
+
+    mismatch_counts = counts.copy()
+    for illion_category in mismatch_counts.index:
+        if illion_category in mismatch_counts.columns:
+            mismatch_counts.loc[illion_category, illion_category] = 0
+
+    mismatch_totals = mismatch_counts.sum(axis=1).replace(0, pd.NA)
+    mismatch_share = (
+        mismatch_counts.div(mismatch_totals, axis=0).mul(100).fillna(0).round(1)
+    )
+
+    return {
+        "category_flow_count": _add_count_totals(counts),
+        "category_flow_row_pct": _add_share_totals(row_pct, counts),
+        "category_mismatch_share": _add_share_totals(mismatch_share, mismatch_counts),
+    }
+
+
+def _add_count_totals(df: pd.DataFrame) -> pd.DataFrame:
+    output = df.copy()
+    output["合计"] = output.sum(axis=1)
+    total_row = output.sum(axis=0)
+    total_row.name = "合计"
+    return pd.concat([output, total_row.to_frame().T]).astype(int)
+
+
+def _add_share_totals(df: pd.DataFrame, basis_counts: pd.DataFrame) -> pd.DataFrame:
+    output = df.copy()
+    row_totals = basis_counts.sum(axis=1)
+    output["合计"] = row_totals.where(row_totals == 0, 100.0)
+
+    grand_total = basis_counts.to_numpy().sum()
+    if grand_total:
+        total_row = basis_counts.sum(axis=0).div(grand_total).mul(100).round(1)
+    else:
+        total_row = pd.Series(0.0, index=basis_counts.columns)
+    total_row["合计"] = 100.0 if grand_total else 0.0
+    total_row.name = "合计"
+    return pd.concat([output, total_row.to_frame().T]).round(1)
+
+
+def _sort_heatmap_axes(df: pd.DataFrame) -> pd.DataFrame:
+    row_order = df.sum(axis=1).sort_values(ascending=False).index
+    col_order = df.sum(axis=0).sort_values(ascending=False).index
+    return df.loc[row_order, col_order]
 
 
 def _top_finv_mismatch_cats(df: pd.DataFrame, mismatch_mask: pd.Series,
@@ -299,12 +366,15 @@ def write_metrics_xlsx(results: dict, ranking: list[dict],
         _write_distribution_sheet(
             writer, "finv_only_categories", results["finv_only_categories"]
         )
+        _write_heatmap_sheets(writer, results["category_heatmaps"])
         if not sample_df.empty:
             sample_df.to_excel(writer, sheet_name="disagreement_samples", index=False)
 
+        heatmap_sheet_names = set(results["category_heatmaps"])
         for name in writer.book.sheetnames:
             ws = writer.book[name]
-            _style_header(ws)
+            if name not in heatmap_sheet_names:
+                _style_header(ws)
             _set_base_font(ws)
             _auto_width(ws)
 
@@ -402,6 +472,26 @@ def _write_distribution_sheet(writer, sheet_name: str, rows: list[dict]) -> None
     pd.DataFrame(rows).to_excel(writer, sheet_name=sheet_name, index=False)
 
 
+def _write_heatmap_sheets(writer, heatmaps: dict[str, pd.DataFrame]) -> None:
+    sheet_titles = {
+        "category_flow_count": "illion分类 vs finv分类 - 交易数量(含空值)",
+        "category_flow_row_pct": "illion分类 vs finv分类 - 行内占比%(含空值)",
+        "category_mismatch_share": "illion分类差异流向 - 占差异/缺口%(含空值)",
+    }
+    for sheet_name, df in heatmaps.items():
+        output_df = df.copy()
+        output_df.index.name = "illion_category \\ finv_category"
+        output_df.to_excel(writer, sheet_name=sheet_name)
+        ws = writer.book[sheet_name]
+        ws.insert_rows(1)
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ws.max_column)
+        ws.cell(row=1, column=1).value = sheet_titles.get(sheet_name, sheet_name)
+        ws.cell(row=1, column=1).font = TITLE_FONT
+        ws.cell(row=1, column=1).alignment = Alignment(horizontal="left")
+        ws.freeze_panes = "B3"
+        _apply_heatmap_format(ws, is_percent=sheet_name != "category_flow_count")
+
+
 def _write_ranking_sheet(writer, ranking: list[dict]) -> None:
     df = pd.DataFrame(ranking)
     df.index = range(1, len(df) + 1)
@@ -426,6 +516,59 @@ def _write_ranking_sheet(writer, ranking: list[dict]) -> None:
                         cell.fill = YELLOW_FILL
                 except (ValueError, TypeError):
                     pass
+
+
+def _apply_heatmap_format(ws, is_percent: bool) -> None:
+    if ws.max_row < 3 or ws.max_column < 2:
+        return
+
+    start_row = 3
+    start_col = 2
+    data_end_row = ws.max_row - 1 if ws.max_row > start_row else ws.max_row
+    data_end_col = ws.max_column - 1 if ws.max_column > start_col else ws.max_column
+    start_cell = ws.cell(row=start_row, column=start_col).coordinate
+    end_cell = ws.cell(row=data_end_row, column=data_end_col).coordinate
+    ws.conditional_formatting.add(
+        f"{start_cell}:{end_cell}",
+        ColorScaleRule(
+            start_type="min", start_color="FFFFFF",
+            mid_type="percentile", mid_value=50, mid_color="FFEB9C",
+            end_type="max", end_color="F8696B",
+        ),
+    )
+
+    number_format = "0.0" if is_percent else "#,##0"
+    for row in ws.iter_rows(min_row=start_row, max_row=ws.max_row,
+                            min_col=start_col, max_col=ws.max_column):
+        for cell in row:
+            cell.number_format = number_format
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for cell in ws[2]:
+        if cell.value is not None:
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+            cell.alignment = Alignment(horizontal="center", vertical="center",
+                                       wrap_text=True)
+            cell.border = THIN_BORDER
+
+    for row in range(start_row, ws.max_row + 1):
+        cell = ws.cell(row=row, column=1)
+        cell.fill = LIGHT_GRAY_FILL
+        cell.font = Font(name="微软雅黑", bold=True, size=10)
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+
+    total_row = ws.max_row
+    total_col = ws.max_column
+    for cell in ws[total_row]:
+        cell.fill = LIGHT_GRAY_FILL
+        cell.font = Font(name="微软雅黑", bold=True, size=10)
+        cell.border = THIN_BORDER
+    for row in range(2, ws.max_row + 1):
+        cell = ws.cell(row=row, column=total_col)
+        cell.fill = LIGHT_GRAY_FILL
+        cell.font = Font(name="微软雅黑", bold=True, size=10)
+        cell.border = THIN_BORDER
 
 
 # ═══════════════════════════════════════════════════════════════════
