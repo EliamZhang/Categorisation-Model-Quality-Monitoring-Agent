@@ -29,9 +29,9 @@ OUTPUT_METRICS = PROJECT_ROOT / "category_quality_metrics.xlsx"
 # ═══════════════════════════════════════════════════════════════════
 
 HEADER_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
-TITLE_FONT = Font(bold=True, size=14, color="1F4E79")
-SUBTITLE_FONT = Font(bold=True, size=12, color="2E75B6")
+HEADER_FONT = Font(name="微软雅黑", color="FFFFFF", bold=True, size=11)
+TITLE_FONT = Font(name="微软雅黑", bold=True, size=14, color="1F4E79")
+SUBTITLE_FONT = Font(name="微软雅黑", bold=True, size=12, color="2E75B6")
 
 GREEN_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
 RED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
@@ -305,6 +305,7 @@ def write_metrics_xlsx(results: dict, ranking: list[dict],
         for name in writer.book.sheetnames:
             ws = writer.book[name]
             _style_header(ws)
+            _set_base_font(ws)
             _auto_width(ws)
 
 
@@ -393,7 +394,7 @@ def _write_summary_sheet(writer, results: dict) -> None:
         elif val == "":
             continue
         else:
-            ws.cell(row=row_idx, column=1).font = Font(bold=True, size=10)
+            ws.cell(row=row_idx, column=1).font = Font(name="微软雅黑", bold=True, size=10)
             ws.cell(row=row_idx, column=2).alignment = Alignment(horizontal="left")
 
 
@@ -439,6 +440,17 @@ def _style_header(ws) -> None:
             cell.alignment = Alignment(horizontal="center", vertical="center",
                                         wrap_text=True)
             cell.border = THIN_BORDER
+
+
+def _set_base_font(ws) -> None:
+    """Apply 微软雅黑 to all data cells (rows 2+), preserving header style."""
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=ws.max_column):
+        for cell in row:
+            if cell.font and cell.font.name:
+                cell.font = Font(name="微软雅黑", bold=cell.font.bold,
+                                 color=cell.font.color, size=cell.font.size)
+            else:
+                cell.font = Font(name="微软雅黑", size=10)
 
 
 def _auto_width(ws, min_w: int = 8, max_w: int = 50) -> None:
