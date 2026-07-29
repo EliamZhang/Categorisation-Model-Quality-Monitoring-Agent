@@ -985,13 +985,12 @@ def write_core_sheet(
 
     # Section 3: 主要差异流向
     row = cat_header + len(category_comparison) + 2
-    top_flows = difference_flows.head(config.top_n).copy()
-    style_section_title(ws, row, f"3. Top {len(top_flows)} Category 差异流向", len(top_flows.columns))
+    style_section_title(ws, row, f"3. Category 差异流向 ({len(difference_flows)} rows)", len(difference_flows.columns))
     flow_header = row + 1
-    top_flows.to_excel(writer, sheet_name=sheet_name, index=False, startrow=flow_header - 1)
+    difference_flows.to_excel(writer, sheet_name=sheet_name, index=False, startrow=flow_header - 1)
     style_header(ws, flow_header)
-    format_dataframe_region(ws, flow_header, len(top_flows))
-    apply_count_data_bar(ws, flow_header, len(top_flows), ["数量"])
+    format_dataframe_region(ws, flow_header, len(difference_flows))
+    apply_count_data_bar(ws, flow_header, len(difference_flows), ["数量"])
 
     ws.freeze_panes = "A6"
     ws.sheet_properties.tabColor = NAVY
