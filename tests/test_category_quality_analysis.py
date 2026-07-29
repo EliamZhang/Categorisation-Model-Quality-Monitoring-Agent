@@ -101,27 +101,18 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         prepared_df, display_map, prep_meta = prepare_comparison_data(raw_df, config)
         category_metrics = compute_category_metrics(prepared_df, display_map, config)
         cp_coverage = compute_counterparty_coverage(prepared_df, config)
-        segment_analysis = pd.DataFrame()
-        data_quality = {
-            "checks": pd.DataFrame(),
-            "missing_patterns": pd.DataFrame(),
-            "category_variants": pd.DataFrame(),
-        }
         details = pd.DataFrame()
-        disagreements = pd.DataFrame()
-        qa_sample = pd.DataFrame()
 
         write_report(
             prepared_df, config, prep_meta,
             category_metrics, cp_coverage,
-            segment_analysis, data_quality,
-            details, disagreements, qa_sample,
+            details,
         )
 
         wb = openpyxl.load_workbook(output, data_only=False)
         expected = {
             "00_dashboard", "01_指标汇总", "02_Category表现",
-            "03_混淆矩阵_数量", "08_差异明细", "09_全量比对",
+            "03_混淆矩阵_数量", "06_全量比对",
         }
         self.assertTrue(expected.issubset(set(wb.sheetnames)))
 

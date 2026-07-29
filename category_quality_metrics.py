@@ -35,10 +35,10 @@ import json
 import math
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -73,17 +73,6 @@ STATUS_CN = {
     "candidate_only": "仅候选方有值",
     "both_empty": "双方为空",
 }
-
-DEFAULT_AUTO_SEGMENT_COLUMNS = (
-    "dr_cr", "classification_engine", "trx_type", "account_type", "product", "app_lower",
-)
-
-COMMON_DETAIL_COLUMNS = (
-    "user_id", "cust_id", "application_id", "listing_id", "job_id",
-    "transaction_id", "illion_trx_uuid", "transaction_date", "date",
-    "amount", "dr_cr", "text", "description",
-    "classification_engine", "classification_rule_id", "classification_reason",
-)
 
 # Excel theme
 NAVY = "1F4E78"
@@ -129,9 +118,6 @@ class ReportConfig:
     top_n: int = 20
     min_category_support_for_rate_chart: int = 20
     max_detail_rows: int = EXCEL_MAX_DATA_ROWS
-    qa_examples_per_pair: int = 5
-    segment_columns: list[str] = field(default_factory=list)
-    detail_columns: list[str] = field(default_factory=list)
     exclude_reference_counterparty_equal_category: bool = True
 
     @property
@@ -205,16 +191,6 @@ def as_python_scalar(value: Any) -> Any:
 def sanitize_sheet_name(name: str) -> str:
     name = re.sub(r"[\\/*?:\[\]]", "_", name)
     return name[:31] or "Sheet"
-
-
-def unique_preserve_order(values: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    output: list[str] = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            output.append(value)
-    return output
 
 
 def mode_or_first(values: pd.Series, fallback: str) -> str:
@@ -327,46 +303,11 @@ def map_display(keys: pd.Series, display_map: Mapping[str, str]) -> pd.Series:
     ).astype("string")
 
 
-def detect_date_column(df: pd.DataFrame) -> str | None:
-    for col in ("transaction_date", "date", "trx_date", "created_at"):
-        if col in df.columns:
-            return col
-    return None
-
-
-def detect_amount_column(df: pd.DataFrame) -> str | None:
-    for col in ("amount", "transaction_amount", "amt"):
-        if col in df.columns:
-            return col
-    return None
-
-
-def add_derived_segments(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    derived: list[str] = []
-    output = df.copy()
-    date_col = detect_date_column(output)
-    if date_col:
-        parsed = pd.to_datetime(output[date_col], errors="coerce")
-        if parsed.notna().any():
-            output["__transaction_month"] = parsed.dt.to_period("M").astype("string")
-            derived.append("__transaction_month")
-    amount_col = detect_amount_column(output)
-    if amount_col:
-        amount = pd.to_numeric(output[amount_col], errors="coerce")
-        if amount.notna().any():
-            abs_amount = amount.abs()
-            bins = [-np.inf, 10, 50, 100, 500, 1000, 5000, np.inf]
-            labels = ["<=10", "10-50", "50-100", "100-500", "500-1,000", "1,000-5,000", ">5,000"]
-            output["__amount_band"] = pd.cut(abs_amount, bins=bins, labels=labels).astype("string")
-            derived.append("__amount_band")
-    return output, derived
-
-
 def prepare_comparison_data(
     raw_df: pd.DataFrame, config: ReportConfig,
 ) -> tuple[pd.DataFrame, dict[str, str], dict[str, Any]]:
     """生成统一清洗字段、Category 状态和 Counterparty 覆盖率标记."""
-    df, derived_segments = add_derived_segments(raw_df)
+    df = raw_df.copy()
     alias_to_key, canonical_display = load_alias_mapping(config.alias_json)
 
     rc = config.reference_category
@@ -429,7 +370,6 @@ def prepare_comparison_data(
     df["__ref_cp_polluted"] = polluted
 
     prep_meta = {
-        "derived_segment_columns": derived_segments,
         "alias_count": len(alias_to_key),
         "reference_cp_polluted_count": int(polluted.sum()),
     }
@@ -745,192 +685,17 @@ def build_status_distribution(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def choose_segment_columns(
-    df: pd.DataFrame, config: ReportConfig, derived_segments: Sequence[str],
-) -> list[str]:
-    requested = config.segment_columns
-    if requested:
-        missing = [col for col in requested if col not in df.columns]
-        if missing:
-            raise KeyError("指定的 segment 字段不存在: " + ", ".join(missing))
-        return unique_preserve_order(requested)
-    auto = [col for col in DEFAULT_AUTO_SEGMENT_COLUMNS if col in df.columns]
-    auto.extend(derived_segments)
-    output = []
-    for col in unique_preserve_order(auto):
-        cardinality = df[col].nunique(dropna=False)
-        if cardinality <= 100:
-            output.append(col)
-    return output
-
-
-def compute_segment_analysis(df: pd.DataFrame, segment_columns: Sequence[str]) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for segment_col in segment_columns:
-        work = df.copy()
-        work["__segment_value"] = clean_series(work[segment_col]).fillna("(空值)")
-        value_counts = work["__segment_value"].value_counts(dropna=False)
-        if len(value_counts) > 50:
-            top_values = set(value_counts.head(50).index)
-            work["__segment_value"] = work["__segment_value"].where(
-                work["__segment_value"].isin(top_values), "(其他)"
-            )
-
-        for segment_value, group in work.groupby("__segment_value", dropna=False):
-            ref_cat = group["__ref_cat_key"].notna()
-            cand_cat = group["__cand_cat_key"].notna()
-            joint_cat = ref_cat & cand_cat
-            cat_status = group["__category_status"].astype("string")
-            cat_match = cat_status.isin(["exact_match", "normalized_match"])
-
-            ref_cp = group["__ref_cp_effective"].astype(bool)
-            cand_cp = group["__cand_cp_effective"].astype(bool)
-
-            rows.append({
-                "segment_column": segment_col,
-                "segment_value": segment_value,
-                "rows": len(group),
-                "row_share": pct(len(group), len(df)),
-                "reference_category_coverage": pct(ref_cat.sum(), len(group)),
-                "candidate_category_coverage": pct(cand_cat.sum(), len(group)),
-                "category_joint_nonempty": int(joint_cat.sum()),
-                "category_agreement_when_both_nonempty": pct(cat_match.sum(), joint_cat.sum()),
-                "category_mismatch_count": int(cat_status.eq("mismatch").sum()),
-                "category_reference_only_count": int(cat_status.eq("reference_only").sum()),
-                "category_candidate_only_count": int(cat_status.eq("candidate_only").sum()),
-                "reference_counterparty_coverage": pct(ref_cp.sum(), len(group)),
-                "candidate_counterparty_coverage": pct(cand_cp.sum(), len(group)),
-            })
-
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(["segment_column", "rows"], ascending=[True, False])
-
-
-def category_variant_table(clean: pd.Series, keys: pd.Series, source_label: str) -> pd.DataFrame:
-    work = pd.DataFrame({"raw_clean": clean, "normalized_key": keys}).dropna()
-    if work.empty:
-        return pd.DataFrame()
-    result = (
-        work.groupby(["normalized_key", "raw_clean"], dropna=False)
-        .size().rename("count").reset_index()
-    )
-    variant_counts = result.groupby("normalized_key")["raw_clean"].transform("nunique")
-    result.insert(0, "source", source_label)
-    result["variants_for_same_normalized_key"] = variant_counts
-    result = result.sort_values(
-        ["variants_for_same_normalized_key", "normalized_key", "count"],
-        ascending=[False, True, False],
-    )
-    return result
-
-
-def compute_data_quality(
-    raw_df: pd.DataFrame, prepared_df: pd.DataFrame,
-    config: ReportConfig, prep_meta: Mapping[str, Any],
-) -> dict[str, pd.DataFrame]:
-    n = len(raw_df)
-    rows: list[dict[str, Any]] = []
-
-    rows.extend([
-        {"check": "total_rows", "value": n, "rate": 1.0, "severity": "info", "description": "输入数据总行数"},
-        {
-            "check": "fully_duplicated_rows", "value": int(raw_df.duplicated().sum()),
-            "rate": pct(raw_df.duplicated().sum(), n),
-            "severity": "warning" if raw_df.duplicated().any() else "ok",
-            "description": "所有字段完全相同的重复行",
-        },
-        {
-            "check": "reference_counterparty_equal_reference_category",
-            "value": int(prep_meta["reference_cp_polluted_count"]),
-            "rate": pct(prep_meta["reference_cp_polluted_count"], n),
-            "severity": "warning" if prep_meta["reference_cp_polluted_count"] else "ok",
-            "description": "参照方 counterparty 标准化后与参照方 category 相同，被视为污染",
-        },
-        {
-            "check": "alias_rules_loaded", "value": int(prep_meta["alias_count"]),
-            "rate": np.nan, "severity": "info", "description": "加载的 category alias 映射数量",
-        },
-    ])
-
-    for raw_col, clean_col, label in [
-        (config.reference_category, "__ref_cat_clean", f"{config.reference_label}_category"),
-        (config.candidate_category, "__cand_cat_clean", f"{config.candidate_label}_category"),
-        (config.reference_counterparty, "__ref_cp_clean", f"{config.reference_label}_counterparty"),
-        (config.candidate_counterparty, "__cand_cp_clean", f"{config.candidate_label}_counterparty"),
-    ]:
-        raw_as_string = raw_df[raw_col].astype("string")
-        raw_trimmed = raw_as_string.str.strip()
-        changed_by_cleaning = (
-            raw_as_string.notna() & prepared_df[clean_col].notna()
-            & raw_as_string.ne(prepared_df[clean_col])
-        )
-        empty_token_count = int(raw_trimmed.str.casefold().isin(EMPTY_TOKENS).fillna(False).sum())
-        rows.extend([
-            {
-                "check": f"{label}_cleaning_changed",
-                "value": int(changed_by_cleaning.sum()),
-                "rate": pct(changed_by_cleaning.sum(), n),
-                "severity": "info",
-                "description": "原始值在 Unicode/空白清洗后发生变化",
-            },
-            {
-                "check": f"{label}_text_empty_tokens",
-                "value": empty_token_count,
-                "rate": pct(empty_token_count, n),
-                "severity": "warning" if empty_token_count else "ok",
-                "description": "以字符串形式出现的 nan/None/null/N/A 等伪空值",
-            },
-        ])
-
-    id_candidates = [col for col in ("transaction_id", "illion_trx_uuid", "id") if col in raw_df.columns]
-    for id_col in id_candidates:
-        nonempty = clean_series(raw_df[id_col])
-        duplicated = nonempty.notna() & nonempty.duplicated(keep=False)
-        rows.append({
-            "check": f"duplicate_{id_col}",
-            "value": int(duplicated.sum()),
-            "rate": pct(duplicated.sum(), nonempty.notna().sum()),
-            "severity": "warning" if duplicated.any() else "ok",
-            "description": f"字段 {id_col} 的重复记录行数（仅统计非空）",
-        })
-
-    missing_patterns = (
-        pd.DataFrame({
-            "reference_category_has_value": prepared_df["__ref_cat_key"].notna(),
-            "candidate_category_has_value": prepared_df["__cand_cat_key"].notna(),
-            "reference_counterparty_effective": prepared_df["__ref_cp_effective"],
-            "candidate_counterparty_effective": prepared_df["__cand_cp_effective"],
-        })
-        .value_counts(dropna=False).rename("count").reset_index()
-    )
-    missing_patterns["share"] = missing_patterns["count"] / n
-
-    variants = pd.concat([
-        category_variant_table(prepared_df["__ref_cat_clean"], prepared_df["__ref_cat_key"], config.reference_label),
-        category_variant_table(prepared_df["__cand_cat_clean"], prepared_df["__cand_cat_key"], config.candidate_label),
-    ], ignore_index=True)
-
-    return {"checks": pd.DataFrame(rows), "missing_patterns": missing_patterns, "category_variants": variants}
-
-
 # =====================================================================
-# Details and samples
+# Details
 # =====================================================================
 
-def choose_detail_columns(df: pd.DataFrame, config: ReportConfig) -> list[str]:
-    requested = config.detail_columns or list(COMMON_DETAIL_COLUMNS)
-    available = [col for col in requested if col in df.columns]
+def build_detail_table(df: pd.DataFrame, config: ReportConfig) -> pd.DataFrame:
     comparison_cols = [
         config.reference_category, config.candidate_category,
         config.reference_counterparty, config.candidate_counterparty,
     ]
-    return unique_preserve_order(available + comparison_cols)
-
-
-def build_detail_table(df: pd.DataFrame, config: ReportConfig) -> pd.DataFrame:
-    base_cols = choose_detail_columns(df, config)
-    result = df[base_cols].copy()
+    available = [col for col in comparison_cols if col in df.columns]
+    result = df[available].copy()
     result["reference_category_clean"] = df["__ref_cat_clean"]
     result["candidate_category_clean"] = df["__cand_cat_clean"]
     result["reference_category_normalized"] = df["__ref_cat_display"]
@@ -943,69 +708,9 @@ def build_detail_table(df: pd.DataFrame, config: ReportConfig) -> pd.DataFrame:
     return result
 
 
-def sort_disagreement_details(details: pd.DataFrame) -> pd.DataFrame:
-    category_priority = {
-        "mismatch": 0, "reference_only": 1, "candidate_only": 2,
-        "normalized_match": 3, "exact_match": 4, "both_empty": 5,
-    }
-    output = details.copy()
-    output["__cat_priority"] = output["category_comparison_status"].map(category_priority).fillna(99)
-    amount_col = next((c for c in ("amount", "transaction_amount", "amt") if c in output.columns), None)
-    sort_cols = ["__cat_priority"]
-    ascending = [True]
-    if amount_col:
-        output["__abs_amount"] = pd.to_numeric(output[amount_col], errors="coerce").abs()
-        sort_cols.append("__abs_amount")
-        ascending.append(False)
-    output = output.sort_values(sort_cols, ascending=ascending)
-    return output.drop(columns=[c for c in ["__cat_priority", "__abs_amount"] if c in output.columns])
-
-
-def build_disagreement_details(details: pd.DataFrame) -> pd.DataFrame:
-    category_issue = details["category_comparison_status"].isin(["mismatch", "reference_only", "candidate_only"])
-    return sort_disagreement_details(details.loc[category_issue].copy())
-
-
-def build_qa_sample(df: pd.DataFrame, details: pd.DataFrame, examples_per_pair: int) -> pd.DataFrame:
-    mismatch = df["__category_status"].astype("string").eq("mismatch")
-    if not mismatch.any():
-        return pd.DataFrame()
-
-    work = details.loc[mismatch].copy()
-    work["__pair"] = (
-        work["reference_category_normalized"].fillna("(空)")
-        + " -> " + work["candidate_category_normalized"].fillna("(空)")
-    )
-    pair_counts = work["__pair"].value_counts()
-    work["confusion_pair_count"] = work["__pair"].map(pair_counts)
-    sample = (
-        work.groupby("__pair", group_keys=False, sort=False)
-        .head(examples_per_pair)
-        .sort_values(["confusion_pair_count", "__pair"], ascending=[False, True])
-    )
-    sample.insert(0, "confusion_pair", sample.pop("__pair"))
-    return sample
-
-
 # =====================================================================
-# Metric dictionary / summary table
+# Summary table
 # =====================================================================
-
-def build_metric_dictionary(config: ReportConfig) -> pd.DataFrame:
-    rows = [
-        ["reference_category_coverage", "覆盖率", "参照方 Category 非空行数 / 总行数", "无人工真值要求"],
-        ["candidate_category_coverage", "覆盖率", "候选方 Category 非空行数 / 总行数", "无人工真值要求"],
-        ["joint_agreement_rate", "Category 一致性", "双方 Category 都非空时，标准化后相同 / 双方都非空", "不是人工真值准确率"],
-        ["coverage_adjusted_agreement_rate", "Category 一致性", "标准化后相同 / 至少一方 Category 非空", "同时惩罚覆盖缺口"],
-        ["macro_precision_vs_reference", "方向性指标", "以参照方为基准，各类别 Precision 的简单平均", "参照方不是人工真值时仅表示相似程度"],
-        ["macro_recall_vs_reference", "方向性指标", "以参照方为基准，各类别 Recall 的简单平均", "参照方不是人工真值时仅表示相似程度"],
-        ["macro_f1_vs_reference", "方向性指标", "各类别 F1 的简单平均", "对小类别敏感"],
-        ["weighted_f1_vs_reference", "方向性指标", "按参照方类别 support 加权的 F1", "更受大类别影响"],
-        ["cohen_kappa", "一致性校正", "剔除随机一致概率后的 Category 一致性", "范围通常 -1~1"],
-        ["multiclass_mcc", "一致性校正", "多分类 Matthews Correlation Coefficient", "范围 -1~1"],
-    ]
-    return pd.DataFrame(rows, columns=["metric", "group", "definition", "interpretation_note"])
-
 
 def build_summary_table(
     category_summary: Mapping[str, Any],
@@ -1263,54 +968,6 @@ def set_reasonable_widths(ws, max_width: int = 45) -> None:
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
 
-def apply_percentage_formats(ws, header_row: int = 1) -> None:
-    percent_keywords = ("rate", "share", "coverage", "precision", "recall", "f1",
-                        "percentage", "pct", "比例", "率", "占比")
-    for cell in ws[header_row]:
-        header = str(cell.value or "").casefold()
-        if any(keyword in header for keyword in percent_keywords):
-            for row in range(header_row + 1, ws.max_row + 1):
-                ws.cell(row, cell.column).number_format = "0.00%"
-
-
-def apply_integer_formats(ws, header_row: int = 1) -> None:
-    count_keywords = ("count", "rows", "support", "positive", "negative", "总数", "数量", "行数", "缺口数")
-    for cell in ws[header_row]:
-        header = str(cell.value or "").casefold()
-        if any(keyword in header for keyword in count_keywords):
-            for row in range(header_row + 1, ws.max_row + 1):
-                ws.cell(row, cell.column).number_format = "#,##0"
-
-
-def apply_rate_color_scale(ws, header_row: int = 1) -> None:
-    for cell in ws[header_row]:
-        header = str(cell.value or "").casefold()
-        if any(k in header for k in ("rate", "coverage", "precision", "recall", "f1")):
-            if ws.max_row > header_row:
-                col_letter = get_column_letter(cell.column)
-                ws.conditional_formatting.add(
-                    f"{col_letter}{header_row + 1}:{col_letter}{ws.max_row}",
-                    ColorScaleRule(
-                        start_type="num", start_value=0, start_color=LIGHT_RED,
-                        mid_type="num", mid_value=0.8, mid_color=LIGHT_YELLOW,
-                        end_type="num", end_value=1, end_color=LIGHT_GREEN,
-                    ),
-                )
-
-
-def apply_disagreement_formatting(ws, header_row: int = 1) -> None:
-    headers = {str(cell.value): cell.column for cell in ws[header_row] if cell.value is not None}
-    col_idx = headers.get("category_comparison_status")
-    if not col_idx or ws.max_row <= header_row:
-        return
-    col = get_column_letter(col_idx)
-    data_range = f"A{header_row + 1}:{get_column_letter(ws.max_column)}{ws.max_row}"
-    ws.conditional_formatting.add(
-        data_range,
-        ColorScaleRule(start_type="min", start_color=WHITE, end_type="max", end_color=LIGHT_RED),
-    )
-
-
 def apply_confusion_heatmap(ws, title_rows: int = 1, percent: bool = False) -> None:
     header_row = title_rows + 1
     start_row = header_row + 1
@@ -1472,11 +1129,7 @@ def write_report(
     prep_meta: Mapping[str, Any],
     category_metrics: Mapping[str, Any],
     cp_coverage: Mapping[str, Any],
-    segment_analysis: pd.DataFrame,
-    data_quality: Mapping[str, pd.DataFrame],
     details: pd.DataFrame,
-    disagreements: pd.DataFrame,
-    qa_sample: pd.DataFrame,
 ) -> None:
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1505,13 +1158,9 @@ def write_report(
         )
         next_row = write_section(ws, category_metrics["confusion_pairs"], "主要不一致流向", next_row)
         write_section(ws, category_metrics["coverage_gaps"], "单边覆盖缺口分布", next_row)
-        apply_rate_color_scale(ws, header_row=2)
-        # Also apply to later sections
-        for marker in range(1, ws.max_row + 1):
-            pass  # color scale already applied from header_row 2
         _finalize_sheet(ws, title_present=True)
 
-        # ---- 03-05 混淆矩阵 (unchanged) -----------------------------------
+        # ---- 03-05 混淆矩阵 -----------------------------------------------
         write_confusion_sheet(writer, "03_混淆矩阵_数量", category_metrics["confusion_count"],
                               "Category confusion matrix - count", percent=False)
         write_confusion_sheet(writer, "04_混淆矩阵_行占比", category_metrics["confusion_row_pct"],
@@ -1519,28 +1168,8 @@ def write_report(
         write_confusion_sheet(writer, "05_混淆矩阵_列占比", category_metrics["confusion_col_pct"],
                               f"Confusion matrix - column %（{config.candidate_label} ← {config.reference_label}）", percent=True)
 
-        # ---- 06 分群分析 --------------------------------------------------
-        write_dataframe(writer, "06_分群分析", segment_analysis, title="分群表现分析")
-        ws = writer.book["06_分群分析"]
-        apply_rate_color_scale(ws, header_row=3)
-
-        # ---- 07 数据质量 --------------------------------------------------
-        ws_name = sanitize_sheet_name("07_数据质量")
-        ws = writer.book.create_sheet(ws_name)
-        next_row = write_section(ws, data_quality["checks"], "数据质量检查", 1)
-        next_row = write_section(ws, data_quality["missing_patterns"], "字段有效性组合分布", next_row)
-        write_section(ws, data_quality["category_variants"], "同一标准化 Category 的原始写法变体", next_row)
-        _finalize_sheet(ws, title_present=True)
-
-        # ---- 08 差异明细 --------------------------------------------------
-        ws_name = sanitize_sheet_name("08_差异明细")
-        ws = writer.book.create_sheet(ws_name)
-        next_row = write_section(ws, qa_sample, "QA 样本（按混淆对抽取）", 1, max_rows=max_detail)
-        next_row = write_section(ws, disagreements, "全部差异与覆盖缺口明细", next_row, max_rows=max_detail)
-        _finalize_sheet(ws, title_present=True)
-
-        # ---- 09 全量比对 --------------------------------------------------
-        write_dataframe(writer, "09_全量比对", details, title="全量逐交易比对结果", max_rows=max_detail)
+        # ---- 06 全量比对 --------------------------------------------------
+        write_dataframe(writer, "06_全量比对", details, title="全量逐交易比对结果", max_rows=max_detail)
 
         # ---- Dashboard (last, placed at position 0) -----------------------
         write_dashboard(writer, category_summary, cp_coverage,
@@ -1551,8 +1180,7 @@ def write_report(
             "00_dashboard": NAVY, "01_指标汇总": BLUE,
             "02_Category表现": GREEN, "03_混淆矩阵_数量": RED,
             "04_混淆矩阵_行占比": ORANGE, "05_混淆矩阵_列占比": ORANGE,
-            "06_分群分析": DARK_BLUE, "07_数据质量": GRAY,
-            "08_差异明细": RED, "09_全量比对": GRAY,
+            "06_全量比对": GRAY,
         }
         for name, color in tab_colors.items():
             if name in writer.book.sheetnames:
@@ -1608,12 +1236,6 @@ def print_summary(
 # CLI
 # =====================================================================
 
-def parse_csv_list(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [part.strip() for part in value.split(",") if part.strip()]
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a comprehensive comparison report for two category systems."
@@ -1632,11 +1254,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-category-support-for-rate-chart", type=int, default=20,
                         help="Category 图表最小 support")
     parser.add_argument("--max-detail-rows", type=int, default=EXCEL_MAX_DATA_ROWS,
-                        help="每个明细 sheet 最大输出行数")
-    parser.add_argument("--qa-examples-per-pair", type=int, default=5,
-                        help="每个 Category 混淆对抽取的 QA 样本数")
-    parser.add_argument("--segment-columns", default=None, help="逗号分隔的分群字段")
-    parser.add_argument("--detail-columns", default=None, help="逗号分隔的明细保留字段")
+                        help="全量明细最大输出行数")
     parser.add_argument("--keep-reference-counterparty-equal-category", action="store_true",
                         help="不把 reference counterparty == reference category 视为污染")
     return parser.parse_args(argv)
@@ -1657,9 +1275,6 @@ def build_config(args: argparse.Namespace) -> ReportConfig:
         top_n=args.top_n,
         min_category_support_for_rate_chart=args.min_category_support_for_rate_chart,
         max_detail_rows=args.max_detail_rows,
-        qa_examples_per_pair=args.qa_examples_per_pair,
-        segment_columns=parse_csv_list(args.segment_columns),
-        detail_columns=parse_csv_list(args.detail_columns),
         exclude_reference_counterparty_equal_category=(
             not args.keep_reference_counterparty_equal_category
         ),
@@ -1680,23 +1295,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     print("[3/6] Computing Category metrics...")
     category_metrics = compute_category_metrics(prepared_df, display_map, config)
 
-    print("[4/6] Computing Counterparty coverage, segment and data-quality metrics...")
+    print("[4/6] Computing Counterparty coverage metrics...")
     cp_coverage = compute_counterparty_coverage(prepared_df, config)
-    segment_cols = choose_segment_columns(prepared_df, config, prep_meta["derived_segment_columns"])
-    segment_analysis = compute_segment_analysis(prepared_df, segment_cols)
-    data_quality = compute_data_quality(raw_df, prepared_df, config, prep_meta)
 
-    print("[5/6] Building transaction-level details and QA samples...")
+    print("[5/6] Building transaction-level details...")
     details = build_detail_table(prepared_df, config)
-    disagreements = build_disagreement_details(details)
-    qa_sample = build_qa_sample(prepared_df, details, config.qa_examples_per_pair)
 
     print("[6/6] Writing Excel report...")
     write_report(
         prepared_df, config, prep_meta,
         category_metrics, cp_coverage,
-        segment_analysis, data_quality,
-        details, disagreements, qa_sample,
+        details,
     )
 
     print_summary(category_metrics["summary"], cp_coverage, config)
