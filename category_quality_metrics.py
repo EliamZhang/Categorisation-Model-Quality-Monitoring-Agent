@@ -720,14 +720,14 @@ def style_title(
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_col)
     cell = ws.cell(1, 1, title)
     cell.fill = PatternFill("solid", fgColor=NAVY)
-    cell.font = Font(name="微软雅黑", size=16, bold=True, color=WHITE)
+    cell.font = Font(size=16, bold=True, color=WHITE)
     cell.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[1].height = 28
 
     if subtitle:
         ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=end_col)
         sub = ws.cell(2, 1, subtitle)
-        sub.font = Font(name="微软雅黑", size=10, italic=True, color=NAVY)
+        sub.font = Font(size=10, italic=True, color=NAVY)
         sub.alignment = Alignment(horizontal="left", vertical="center")
 
 
@@ -736,7 +736,7 @@ def style_header(ws, row: int) -> None:
         if cell.value is None:
             continue
         cell.fill = PatternFill("solid", fgColor=BLUE)
-        cell.font = Font(name="微软雅黑", size=10, bold=True, color=WHITE)
+        cell.font = Font(size=10, bold=True, color=WHITE)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = BORDER
     ws.row_dimensions[row].height = 30
@@ -746,7 +746,7 @@ def style_section_title(ws, row: int, title: str, end_col: int) -> None:
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=max(1, end_col))
     cell = ws.cell(row, 1, title)
     cell.fill = PatternFill("solid", fgColor=NAVY)
-    cell.font = Font(name="微软雅黑", size=12, bold=True, color=WHITE)
+    cell.font = Font(size=12, bold=True, color=WHITE)
     cell.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[row].height = 24
 
@@ -758,13 +758,6 @@ def set_base_font(ws, start_row: int = 1, max_rows: int | None = None) -> None:
             if cell.row == 1 and cell.fill.fill_type == "solid":
                 continue
             if cell.value is not None:
-                cell.font = Font(
-                    name="微软雅黑",
-                    size=10,
-                    bold=cell.font.bold,
-                    italic=cell.font.italic,
-                    color=cell.font.color if cell.font.color else BLACK,
-                )
                 cell.alignment = Alignment(
                     horizontal=cell.alignment.horizontal,
                     vertical=cell.alignment.vertical or "center",
