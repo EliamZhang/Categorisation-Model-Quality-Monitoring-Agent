@@ -30,7 +30,7 @@ Simplified Category Difference Report
     openpyxl
 
 示例：
-    python category_quality_metrics_simplified.py \
+    python label_compare.py \
         --input classification_report.xlsx \
         --output category_difference_report.xlsx
 """

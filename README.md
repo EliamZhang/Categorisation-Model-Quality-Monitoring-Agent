@@ -6,7 +6,7 @@
 
 ```bash
 pip install pandas openpyxl python-calamine
-python category_quality_metrics.py
+python label_compare.py
 ```
 
 读取 `classification_report.xlsx` → 输出 `category_difference_report.xlsx`。

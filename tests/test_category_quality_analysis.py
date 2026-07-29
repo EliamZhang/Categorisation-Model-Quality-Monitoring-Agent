@@ -6,7 +6,7 @@ from pathlib import Path
 import openpyxl
 import pandas as pd
 
-from category_quality_metrics import (
+from label_compare import (
     ReportConfig,
     build_difference_details,
     compute_category_comparison,
