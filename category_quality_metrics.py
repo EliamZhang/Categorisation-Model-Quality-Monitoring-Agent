@@ -873,7 +873,6 @@ def write_heatmap_sheet(
 
     _apply_heatmap_format(ws, header_row=row_pct_start + 2, data_start=row_pct_start + 3, percent=True)
 
-    ws.freeze_panes = "B4"
     ws.column_dimensions["A"].width = 34
     for col in range(2, ws.max_column + 1):
         ws.column_dimensions[get_column_letter(col)].width = 16
@@ -974,7 +973,6 @@ def write_core_sheet(
     format_dataframe_region(ws, flow_header, len(difference_flows))
     apply_count_data_bar(ws, flow_header, len(difference_flows), ["数量"])
 
-    ws.freeze_panes = "A6"
     ws.sheet_properties.tabColor = NAVY
     set_widths(ws, {
         "指标": 30,
@@ -1022,7 +1020,6 @@ def write_detail_sheet(
                 fill = LIGHT_RED if cell.value == "分类不一致" else LIGHT_ORANGE
                 cell.fill = PatternFill("solid", fgColor=fill)
 
-    ws.freeze_panes = "A4"
     ws.sheet_properties.tabColor = GRAY
     set_widths(ws, {
         "Category比对状态": 20,
