@@ -92,7 +92,7 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         category_comparison = compute_category_comparison(df, display_map, config)
         difference_flows = compute_difference_flows(df)
         count_matrix, row_pct_matrix = compute_matrices(df)
-        details = build_difference_details(df, config)
+        details = build_difference_details(df, category_comparison, config)
 
         write_report(
             config, summary_table, category_comparison,
@@ -100,7 +100,7 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         )
 
         wb = openpyxl.load_workbook(output, data_only=False)
-        expected = {"00_核心对比", "01_热力图", "03_差异明细"}
+        expected = {"00_核心对比", "01_热力图", "03_排查明细"}
         self.assertTrue(expected.issubset(set(wb.sheetnames)))
 
     def test_summary_has_expected_keys(self) -> None:

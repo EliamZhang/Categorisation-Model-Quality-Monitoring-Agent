@@ -16,7 +16,7 @@ Simplified Category Difference Report
 输出 Excel 保留 3 个 Sheet：
 - 00_核心对比：关键指标、逐 Category 优先级分析、主要差异流向
 - 01_热力图：Category 对比数量矩阵及 reference 行占比
-- 03_差异明细：仅输出不一致和单边缺失的交易
+- 03_排查明细：按排查优先级组织不一致和单边缺失交易，默认隐藏次要技术字段
 
 其中“00_核心对比”的第二张表重点回答：
 - 哪些 reference Category 的差异数量最多？
@@ -55,7 +55,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
-from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
+from openpyxl.formatting.rule import ColorScaleRule, DataBarRule, FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -143,6 +143,20 @@ DEFAULT_DETAIL_COLUMNS = [
     "classification_rule_id",
     "classification_reason",
 ]
+
+# 排查明细中的优先级排序。
+DETAIL_PRIORITY_ORDER = ["P1", "P2", "P3"]
+
+# 第三个 Sheet 默认隐藏的技术/追溯字段。
+# 字段仍保留在 Excel 中，需要时可以手动取消隐藏。
+DEFAULT_HIDDEN_DETAIL_COLUMNS = {
+    "classification_engine",
+    "classification_rule_id",
+    "classification_status",
+    "job_id",
+    "bank_account_id",
+    "sample_datetime",
+}
 
 # Excel theme
 NAVY = "1F4E78"
@@ -927,10 +941,29 @@ def compute_matrices(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return counts, row_pct
 
 
-def build_difference_details(df: pd.DataFrame, config: ReportConfig) -> pd.DataFrame:
+def build_difference_details(
+    df: pd.DataFrame,
+    category_comparison: pd.DataFrame,
+    config: ReportConfig,
+) -> pd.DataFrame:
+    """生成面向人工排查的差异明细。
+
+    设计原则：
+    1. 先回答“什么问题、是否重要、同类问题有多少”；
+    2. 再展示交易文本、交易对手和两侧分类结果；
+    3. 最后保留用户、申请、交易及模型规则等追溯字段；
+    4. 原始 Category 保留在右侧，Excel 中默认隐藏。
+    """
     status = df["__status"].astype("string")
     difference = status.isin(["mismatch", "reference_only", "candidate_only"])
     diff_df = df.loc[difference].copy()
+
+    r = config.reference_label
+    c = config.candidate_label
+    ref_display_col = f"{r} Category"
+    cand_display_col = f"{c} Category"
+    ref_raw_col = f"{r} Category_原始"
+    cand_raw_col = f"{c} Category_原始"
 
     preferred_columns = list(dict.fromkeys([
         *config.detail_columns,
@@ -938,23 +971,145 @@ def build_difference_details(df: pd.DataFrame, config: ReportConfig) -> pd.DataF
         config.candidate_category,
     ]))
     available = [col for col in preferred_columns if col in diff_df.columns]
-
     result = diff_df[available].copy()
-    result["illion Category_标准化"] = diff_df["__ref_display"]
-    result["finv Category_标准化"] = diff_df["__cand_display"]
+
+    # 原始分类保留但移到右侧，避免与标准化后的排查口径混在一起。
+    rename_map: dict[str, str] = {}
+    if config.reference_category in result.columns:
+        rename_map[config.reference_category] = ref_raw_col
+    if config.candidate_category in result.columns:
+        rename_map[config.candidate_category] = cand_raw_col
+    result = result.rename(columns=rename_map)
+
+    # 排查核心字段。
+    result[ref_display_col] = diff_df["__ref_display"].fillna(EMPTY_LABEL)
+    result[cand_display_col] = diff_df["__cand_display"].fillna(EMPTY_LABEL)
+    result["差异流向"] = result[ref_display_col] + " → " + result[cand_display_col]
+
+    type_map = {
+        "mismatch": "分类边界冲突",
+        "reference_only": f"{c}漏识别",
+        "candidate_only": f"{c}新增识别",
+    }
+    result["排查类型"] = status.loc[diff_df.index].map(type_map).fillna("其他差异")
     result["Category比对状态"] = diff_df["__status_cn"]
 
-    # 让核心比对字段靠前
-    leading = [
-        "Category比对状态",
-        config.reference_category,
-        config.candidate_category,
-        "illion Category_标准化",
-        "finv Category_标准化",
+    key_mask = (
+        diff_df["__ref_display"].map(
+            lambda x: is_key_category(str(x), config.key_category_keywords)
+            if not pd.isna(x) else False
+        )
+        | diff_df["__cand_display"].map(
+            lambda x: is_key_category(str(x), config.key_category_keywords)
+            if not pd.isna(x) else False
+        )
+    )
+    result["是否关键Category"] = np.where(key_mask, "是", "否")
+
+    # 同一差异流向的出现次数，帮助排查人员优先处理系统性问题。
+    flow_counts = (
+        diff_df.groupby(["__ref_matrix", "__cand_matrix"], dropna=False)
+        .size()
+        .to_dict()
+    )
+    result["差异流向数量"] = [
+        int(flow_counts.get((ref_value, cand_value), 0))
+        for ref_value, cand_value in zip(
+            diff_df["__ref_matrix"],
+            diff_df["__cand_matrix"],
+        )
     ]
-    leading = [c for c in leading if c in result.columns]
-    remaining = [c for c in result.columns if c not in leading]
-    return result[leading + remaining]
+
+    # 优先使用核心 Sheet 中已经计算出的 reference Category 优先级，保持口径一致。
+    priority_map: dict[str, str] = {}
+    if {"Category", "建议优先级"}.issubset(category_comparison.columns):
+        priority_map = (
+            category_comparison[["Category", "建议优先级"]]
+            .drop_duplicates("Category")
+            .set_index("Category")["建议优先级"]
+            .astype(str)
+            .to_dict()
+        )
+
+    priority = diff_df["__ref_display"].map(priority_map).fillna("P3").astype(str)
+
+    # reference 为空时没有可映射的 reference 优先级：关键 Category 至少提升到 P2。
+    candidate_only_key = status.loc[diff_df.index].eq("candidate_only") & key_mask
+    priority = priority.mask(candidate_only_key & priority.eq("P3"), "P2")
+    priority = priority.where(priority.isin(DETAIL_PRIORITY_ORDER), "P3")
+    result["排查优先级"] = priority
+
+    # 字段分区：问题判断 → 交易证据 → 分类结果 → 追溯信息 → 原始/扩展字段。
+    investigation_columns = [
+        "排查优先级",
+        "排查类型",
+        "差异流向",
+        "差异流向数量",
+        "是否关键Category",
+    ]
+    evidence_columns = [
+        "transaction_date",
+        config.amount_column,
+        "dr_cr",
+        "text",
+        "third_party",
+        "counterparty",
+    ]
+    classification_columns = [
+        ref_display_col,
+        cand_display_col,
+        "classification_reason",
+        "classification_engine",
+        "classification_rule_id",
+    ]
+    tracking_columns = [
+        config.user_id_column,
+        config.application_id_column,
+        "transaction_id",
+        "job_id",
+        "bank_account_id",
+        "sample_datetime",
+    ]
+    raw_and_status_columns = [
+        ref_raw_col,
+        cand_raw_col,
+        "Category比对状态",
+        "classification_status",
+    ]
+
+    ordered = list(dict.fromkeys(
+        investigation_columns
+        + evidence_columns
+        + classification_columns
+        + tracking_columns
+        + raw_and_status_columns
+    ))
+    ordered = [col for col in ordered if col in result.columns]
+    remaining = [col for col in result.columns if col not in ordered]
+    result = result[ordered + remaining]
+
+    # 默认排序：优先级 → 高频差异流向 → Category → 用户 → 交易日期。
+    result["__优先级排序"] = pd.Categorical(
+        result["排查优先级"],
+        categories=DETAIL_PRIORITY_ORDER,
+        ordered=True,
+    )
+    sort_columns = ["__优先级排序", "差异流向数量", ref_display_col, cand_display_col]
+    ascending = [True, False, True, True]
+
+    if config.user_id_column in result.columns:
+        sort_columns.append(config.user_id_column)
+        ascending.append(True)
+    if "transaction_date" in result.columns:
+        sort_columns.append("transaction_date")
+        ascending.append(False)
+
+    result = (
+        result.sort_values(sort_columns, ascending=ascending, kind="stable", na_position="last")
+        .drop(columns="__优先级排序")
+        .reset_index(drop=True)
+    )
+    return result
 
 
 # =====================================================================
@@ -1219,6 +1374,190 @@ def _apply_heatmap_format(ws, header_row: int, data_start: int, percent: bool) -
                     cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
+def style_detail_header(ws, row: int, config: ReportConfig) -> None:
+    """按照排查字段分区设置第三个 Sheet 的表头颜色。"""
+    r = config.reference_label
+    c = config.candidate_label
+    ref_display_col = f"{r} Category"
+    cand_display_col = f"{c} Category"
+
+    investigation = {"排查优先级", "排查类型", "差异流向", "差异流向数量", "是否关键Category"}
+    evidence = {"transaction_date", config.amount_column, "dr_cr", "text", "third_party", "counterparty"}
+    classification = {
+        ref_display_col,
+        cand_display_col,
+        "classification_reason",
+        "classification_engine",
+        "classification_rule_id",
+    }
+
+    for cell in ws[row]:
+        if cell.value is None:
+            continue
+        header = str(cell.value)
+        if header in investigation:
+            fill_color = NAVY
+        elif header in evidence:
+            fill_color = BLUE
+        elif header in classification:
+            fill_color = ORANGE
+        else:
+            fill_color = GRAY
+
+        cell.fill = PatternFill("solid", fgColor=fill_color)
+        cell.font = Font(size=10, bold=True, color=WHITE)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = BORDER
+    ws.row_dimensions[row].height = 34
+
+
+def apply_detail_conditional_formatting(ws, header_row: int, data_rows: int) -> None:
+    if data_rows <= 0:
+        return
+
+    header_map = {
+        str(ws.cell(header_row, col).value): col
+        for col in range(1, ws.max_column + 1)
+        if ws.cell(header_row, col).value is not None
+    }
+    data_start = header_row + 1
+    data_end = header_row + data_rows
+
+    priority_col = header_map.get("排查优先级")
+    if priority_col:
+        letter = get_column_letter(priority_col)
+        cell_range = f"{letter}{data_start}:{letter}{data_end}"
+        ws.conditional_formatting.add(
+            cell_range,
+            FormulaRule(
+                formula=[f'{letter}{data_start}="P1"'],
+                fill=PatternFill("solid", fgColor=LIGHT_RED),
+                font=Font(bold=True, color=RED),
+            ),
+        )
+        ws.conditional_formatting.add(
+            cell_range,
+            FormulaRule(
+                formula=[f'{letter}{data_start}="P2"'],
+                fill=PatternFill("solid", fgColor=LIGHT_YELLOW),
+                font=Font(bold=True, color=BLACK),
+            ),
+        )
+        ws.conditional_formatting.add(
+            cell_range,
+            FormulaRule(
+                formula=[f'{letter}{data_start}="P3"'],
+                fill=PatternFill("solid", fgColor=LIGHT_GREEN),
+                font=Font(bold=True, color=BLACK),
+            ),
+        )
+
+    type_col = header_map.get("排查类型")
+    if type_col:
+        letter = get_column_letter(type_col)
+        cell_range = f"{letter}{data_start}:{letter}{data_end}"
+        ws.conditional_formatting.add(
+            cell_range,
+            FormulaRule(
+                formula=[f'ISNUMBER(SEARCH("分类边界冲突",{letter}{data_start}))'],
+                fill=PatternFill("solid", fgColor=LIGHT_RED),
+            ),
+        )
+        ws.conditional_formatting.add(
+            cell_range,
+            FormulaRule(
+                formula=[f'ISNUMBER(SEARCH("漏识别",{letter}{data_start}))'],
+                fill=PatternFill("solid", fgColor=LIGHT_ORANGE),
+            ),
+        )
+        ws.conditional_formatting.add(
+            cell_range,
+            FormulaRule(
+                formula=[f'ISNUMBER(SEARCH("新增识别",{letter}{data_start}))'],
+                fill=PatternFill("solid", fgColor=LIGHT_BLUE),
+            ),
+        )
+
+    key_col = header_map.get("是否关键Category")
+    if key_col:
+        letter = get_column_letter(key_col)
+        ws.conditional_formatting.add(
+            f"{letter}{data_start}:{letter}{data_end}",
+            FormulaRule(
+                formula=[f'{letter}{data_start}="是"'],
+                fill=PatternFill("solid", fgColor=LIGHT_BLUE),
+                font=Font(bold=True, color=NAVY),
+            ),
+        )
+
+    flow_count_col = header_map.get("差异流向数量")
+    if flow_count_col:
+        letter = get_column_letter(flow_count_col)
+        ws.conditional_formatting.add(
+            f"{letter}{data_start}:{letter}{data_end}",
+            DataBarRule(start_type="min", end_type="max", color=BLUE, showValue=True),
+        )
+
+
+def format_detail_columns(ws, header_row: int, data_rows: int, config: ReportConfig) -> None:
+    """设置第三个 Sheet 的重点字段格式，避免对所有单元格进行重样式处理。"""
+    if data_rows <= 0:
+        return
+
+    header_map = {
+        str(ws.cell(header_row, col).value): col
+        for col in range(1, ws.max_column + 1)
+        if ws.cell(header_row, col).value is not None
+    }
+    data_start = header_row + 1
+    data_end = header_row + data_rows
+
+    center_headers = ["排查优先级", "排查类型", "差异流向数量", "是否关键Category", "dr_cr"]
+    wrap_headers = ["差异流向", "text", "third_party", "counterparty", "classification_reason"]
+
+    for header in center_headers:
+        col = header_map.get(header)
+        if not col:
+            continue
+        for row in range(data_start, data_end + 1):
+            ws.cell(row, col).alignment = Alignment(horizontal="center", vertical="center")
+
+    for header in wrap_headers:
+        col = header_map.get(header)
+        if not col:
+            continue
+        for row in range(data_start, data_end + 1):
+            ws.cell(row, col).alignment = Alignment(vertical="center", wrap_text=True)
+
+    amount_col = header_map.get(config.amount_column)
+    if amount_col:
+        for row in range(data_start, data_end + 1):
+            ws.cell(row, amount_col).number_format = "#,##0.00;[Red]-#,##0.00"
+
+    count_col = header_map.get("差异流向数量")
+    if count_col:
+        for row in range(data_start, data_end + 1):
+            ws.cell(row, count_col).number_format = "#,##0"
+
+
+def hide_detail_columns(ws, header_row: int, config: ReportConfig) -> None:
+    """隐藏默认不需要查看的技术字段和原始 Category 字段。"""
+    hidden_headers = set(DEFAULT_HIDDEN_DETAIL_COLUMNS)
+    hidden_headers.update({
+        f"{config.reference_label} Category_原始",
+        f"{config.candidate_label} Category_原始",
+        "Category比对状态",
+    })
+
+    for col in range(1, ws.max_column + 1):
+        header = ws.cell(header_row, col).value
+        if header is None or str(header) not in hidden_headers:
+            continue
+        dimension = ws.column_dimensions[get_column_letter(col)]
+        dimension.hidden = True
+        dimension.outlineLevel = 1
+
+
 # =====================================================================
 # Report writer
 # =====================================================================
@@ -1338,7 +1677,7 @@ def write_detail_sheet(
     details: pd.DataFrame,
     config: ReportConfig,
 ) -> bool:
-    sheet_name = "03_差异明细"
+    sheet_name = "03_排查明细"
     max_rows = min(config.max_detail_rows, EXCEL_MAX_DATA_ROWS)
     output = details.head(max_rows).copy()
     truncated = len(details) > len(output)
@@ -1346,40 +1685,53 @@ def write_detail_sheet(
     output.to_excel(writer, sheet_name=sheet_name, index=False, startrow=2)
     ws = writer.book[sheet_name]
     subtitle = (
-        f"仅包含分类不一致、仅illion有值、仅finv有值。"
-        f"共 {len(details):,} 行"
+        f"按排查优先级和差异流向排序；仅包含分类不一致、仅{config.reference_label}有值、"
+        f"仅{config.candidate_label}有值。共 {len(details):,} 行"
         + (f"，当前仅输出前 {len(output):,} 行" if truncated else "")
+        + "。灰色技术字段和原始分类默认隐藏，可在 Excel 中取消隐藏。"
     )
-    style_title(ws, "Category 差异明细", subtitle)
-    style_header(ws, 3)
+    style_title(ws, "Category 人工排查明细", subtitle, end_col=max(5, len(output.columns)))
+    style_detail_header(ws, 3, config)
+
+    ws.sheet_view.showGridLines = False
+    ws.sheet_format.defaultRowHeight = 30
+    ws.freeze_panes = "F4"
+    ws.auto_filter.ref = f"A3:{get_column_letter(ws.max_column)}{max(3, ws.max_row)}"
 
     if len(output) > 0:
-        ws.auto_filter.ref = f"A3:{get_column_letter(ws.max_column)}{ws.max_row}"
+        apply_detail_conditional_formatting(ws, 3, len(output))
+        format_detail_columns(ws, 3, len(output), config)
 
-        header_map = {
-            str(ws.cell(3, col).value): col
-            for col in range(1, ws.max_column + 1)
-            if ws.cell(3, col).value is not None
-        }
-        status_col = header_map.get("Category比对状态")
-        if status_col:
-            for row in range(4, ws.max_row + 1):
-                cell = ws.cell(row, status_col)
-                fill = LIGHT_RED if cell.value == "分类不一致" else LIGHT_ORANGE
-                cell.fill = PatternFill("solid", fgColor=fill)
+    hide_detail_columns(ws, 3, config)
 
-    ws.sheet_properties.tabColor = GRAY
+    ws.sheet_properties.tabColor = ORANGE
     set_widths(ws, {
-        "Category比对状态": 20,
-        config.reference_category: 24,
-        config.candidate_category: 24,
-        "illion Category_标准化": 26,
-        "finv Category_标准化": 26,
-        "text": 48,
-        "classification_reason": 50,
+        "排查优先级": 12,
+        "排查类型": 18,
+        "差异流向": 46,
+        "差异流向数量": 14,
+        "是否关键Category": 16,
+        "transaction_date": 16,
+        config.amount_column: 14,
+        "dr_cr": 10,
+        "text": 52,
         "third_party": 30,
         "counterparty": 30,
-    }, max_width=50)
+        f"{config.reference_label} Category": 26,
+        f"{config.candidate_label} Category": 26,
+        "classification_reason": 52,
+        "classification_engine": 24,
+        "classification_rule_id": 24,
+        config.user_id_column: 20,
+        config.application_id_column: 22,
+        "transaction_id": 24,
+        "job_id": 22,
+        "bank_account_id": 24,
+        "sample_datetime": 20,
+        f"{config.reference_label} Category_原始": 26,
+        f"{config.candidate_label} Category_原始": 26,
+        "Category比对状态": 20,
+    }, max_width=52)
 
     return truncated
 
@@ -1564,7 +1916,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     count_matrix, row_pct_matrix = compute_matrices(prepared_df)
 
     print("[5/6] Building difference details...")
-    details = build_difference_details(prepared_df, config)
+    details = build_difference_details(prepared_df, category_comparison, config)
 
     print("[6/6] Writing simplified Excel report...")
     truncated = write_report(
