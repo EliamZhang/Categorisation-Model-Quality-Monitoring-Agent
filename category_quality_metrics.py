@@ -316,7 +316,7 @@ def validate_config(config: ReportConfig) -> None:
 def load_data(config: ReportConfig) -> pd.DataFrame:
     validate_config(config)
     try:
-        df = pd.read_excel(config.input_path, sheet_name=config.sheet_name)
+        df = pd.read_excel(config.input_path, sheet_name=config.sheet_name, engine="calamine")
     except ValueError as exc:
         xls = pd.ExcelFile(config.input_path)
         raise ValueError(
@@ -751,20 +751,6 @@ def style_section_title(ws, row: int, title: str, end_col: int) -> None:
     ws.row_dimensions[row].height = 24
 
 
-def set_base_font(ws, start_row: int = 1, max_rows: int | None = None) -> None:
-    end_row = ws.max_row if max_rows is None else min(ws.max_row, max_rows)
-    for row in ws.iter_rows(min_row=start_row, max_row=end_row):
-        for cell in row:
-            if cell.row == 1 and cell.fill.fill_type == "solid":
-                continue
-            if cell.value is not None:
-                cell.alignment = Alignment(
-                    horizontal=cell.alignment.horizontal,
-                    vertical=cell.alignment.vertical or "center",
-                    wrap_text=cell.alignment.wrap_text,
-                )
-
-
 def set_widths(ws, widths: Mapping[str, float] | None = None, max_width: int = 42) -> None:
     widths = dict(widths or {})
     for col_idx in range(1, ws.max_column + 1):
@@ -887,17 +873,10 @@ def write_heatmap_sheet(
 
     _apply_heatmap_format(ws, header_row=row_pct_start + 2, data_start=row_pct_start + 3, percent=True)
 
-    # ── Overall formatting ─────────────────────────────────────────
-    for row in ws.iter_rows(min_row=3):
-        for cell in row:
-            if cell.value is not None:
-                cell.border = BORDER
-
     ws.freeze_panes = "B4"
     ws.column_dimensions["A"].width = 34
     for col in range(2, ws.max_column + 1):
         ws.column_dimensions[get_column_letter(col)].width = 16
-    set_base_font(ws, max_rows=ws.max_row)
 
 
 def _apply_heatmap_format(ws, header_row: int, data_start: int, percent: bool) -> None:
@@ -913,10 +892,13 @@ def _apply_heatmap_format(ws, header_row: int, data_start: int, percent: bool) -
             ),
         )
         number_format = "0.0%" if percent else "#,##0"
-        for row in ws.iter_rows(min_row=data_start, min_col=2):
+        for row in ws.iter_rows(min_row=data_start):
             for cell in row:
-                cell.number_format = number_format
-                cell.alignment = Alignment(horizontal="center", vertical="center")
+                if cell.value is not None:
+                    cell.border = BORDER
+                if cell.column > 1:
+                    cell.number_format = number_format
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
 # =====================================================================
@@ -1003,7 +985,6 @@ def write_core_sheet(
         "finv Category": 28,
         "差异类型": 20,
     })
-    set_base_font(ws, max_rows=ws.max_row)
 
 
 def write_detail_sheet(
@@ -1028,10 +1009,6 @@ def write_detail_sheet(
 
     if len(output) > 0:
         ws.auto_filter.ref = f"A3:{get_column_letter(ws.max_column)}{ws.max_row}"
-        for row in ws.iter_rows(min_row=4):
-            for cell in row:
-                cell.border = BORDER
-                cell.alignment = Alignment(vertical="center")
 
         header_map = {
             str(ws.cell(3, col).value): col
@@ -1041,9 +1018,9 @@ def write_detail_sheet(
         status_col = header_map.get("Category比对状态")
         if status_col:
             for row in range(4, ws.max_row + 1):
-                value = ws.cell(row, status_col).value
-                fill = LIGHT_RED if value == "分类不一致" else LIGHT_ORANGE
-                ws.cell(row, status_col).fill = PatternFill("solid", fgColor=fill)
+                cell = ws.cell(row, status_col)
+                fill = LIGHT_RED if cell.value == "分类不一致" else LIGHT_ORANGE
+                cell.fill = PatternFill("solid", fgColor=fill)
 
     ws.freeze_panes = "A4"
     ws.sheet_properties.tabColor = GRAY
@@ -1059,8 +1036,6 @@ def write_detail_sheet(
         "counterparty": 30,
     }, max_width=50)
 
-    # 大明细只处理标题和表头字体，避免逐单元格字体处理拖慢速度
-    set_base_font(ws, max_rows=min(ws.max_row, 500))
     return truncated
 
 
