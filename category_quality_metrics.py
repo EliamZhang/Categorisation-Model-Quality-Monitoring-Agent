@@ -1071,6 +1071,96 @@ def build_summary_table(
 # Excel writing helpers
 # =====================================================================
 
+SECTION_HEADER_FILL = PatternFill("solid", fgColor=NAVY)
+SECTION_TITLE_FONT = Font(name="微软雅黑", size=13, bold=True, color=WHITE)
+
+
+def write_section(
+    ws, df: pd.DataFrame, title: str, start_row: int, *,
+    max_rows: int = EXCEL_MAX_DATA_ROWS,
+) -> int:
+    """Write a titled DataFrame block starting at *start_row*.
+
+    Returns the row number immediately after this block (next available row).
+    """
+    output = df.copy()
+    if max_rows >= 0 and len(output) > max_rows:
+        output = output.head(max_rows)
+
+    if output.empty and len(output.columns) == 0:
+        output = pd.DataFrame({"message": ["No data"]})
+
+    # Section title
+    ws.merge_cells(start_row=start_row, start_column=1,
+                   end_row=start_row, end_column=max(1, len(output.columns)))
+    title_cell = ws.cell(start_row, 1, title)
+    title_cell.font = SECTION_TITLE_FONT
+    title_cell.fill = SECTION_HEADER_FILL
+    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[start_row].height = 24
+
+    # Write DataFrame below title
+    header_row = start_row + 1
+    _write_df_to_ws(ws, output, header_row)
+
+    style_header_row(ws, header_row)
+
+    # Apply formatting to this section's data rows
+    _apply_section_formats(ws, header_row, data_start=header_row + 1, data_end=header_row + len(output))
+
+    return header_row + len(output) + 2  # +2 for spacing
+
+
+def _write_df_to_ws(ws, df: pd.DataFrame, start_row: int) -> None:
+    """Write DataFrame values to worksheet starting at start_row (header)."""
+    # Header
+    for c_idx, col_name in enumerate(df.columns, start=1):
+        cell = ws.cell(start_row, c_idx, str(col_name))
+        cell.border = BORDER
+    # Data
+    for r_idx, (_, row) in enumerate(df.iterrows()):
+        for c_idx, col_name in enumerate(df.columns, start=1):
+            val = row[col_name]
+            val = as_python_scalar(val)
+            ws.cell(start_row + 1 + r_idx, c_idx, val).border = BORDER
+
+
+def _apply_section_formats(ws, header_row: int, data_start: int, data_end: int) -> None:
+    """Apply number formatting to one section's data rows."""
+    if data_end < data_start:
+        return
+    percent_kw = ("rate", "share", "coverage", "precision", "recall", "f1",
+                  "percentage", "pct", "比例", "率", "占比")
+    count_kw = ("count", "rows", "support", "positive", "negative", "总数", "数量", "行数", "缺口数")
+    for cell in ws[header_row]:
+        if cell.value is None:
+            continue
+        header = str(cell.value).casefold()
+        for r in range(data_start, data_end + 1):
+            if any(k in header for k in percent_kw):
+                ws.cell(r, cell.column).number_format = "0.00%"
+            elif any(k in header for k in count_kw):
+                ws.cell(r, cell.column).number_format = "#,##0"
+
+
+def _finalize_sheet(ws, *, title_present: bool = True, is_summary: bool = False) -> None:
+    """Apply font and widths to a multi-section sheet."""
+    set_base_font(ws)
+    set_reasonable_widths(ws)
+
+    if is_summary:
+        # Special handling for summary sheet: format the value column by value_type
+        for row in range(3, ws.max_row + 1):
+            value_cell = ws.cell(row, 3)
+            type_cell = ws.cell(row, 4)
+            if type_cell.value == "percentage":
+                value_cell.number_format = "0.00%"
+            elif type_cell.value == "count":
+                value_cell.number_format = "#,##0"
+            elif type_cell.value == "decimal":
+                value_cell.number_format = "0.000"
+
+
 def write_dataframe(
     writer: pd.ExcelWriter, sheet_name: str, df: pd.DataFrame, *,
     index: bool = False, title: str | None = None,
@@ -1392,85 +1482,77 @@ def write_report(
 
     category_summary = category_metrics["summary"]
     summary_table = build_summary_table(category_summary, cp_coverage, config)
-    metric_dictionary = build_metric_dictionary(config)
+    cp_summary_df = pd.DataFrame(
+        [{"metric": key, "value": value} for key, value in cp_coverage.items()]
+    )
+    max_detail = min(config.max_detail_rows, EXCEL_MAX_DATA_ROWS)
 
     with pd.ExcelWriter(config.output_path, engine="openpyxl") as writer:
-        write_dataframe(writer, "01_metric_dictionary", metric_dictionary, title="指标口径说明")
-        write_dataframe(writer, "02_summary", summary_table, title="完整指标汇总")
-        write_dataframe(
-            writer, "03_category_performance", category_metrics["per_category"],
-            title=f"类别级表现（以 {config.reference_label} 为参照）",
+        # ---- 01 指标汇总 --------------------------------------------------
+        ws_name = sanitize_sheet_name("01_指标汇总")
+        ws = writer.book.create_sheet(ws_name, 0)
+        next_row = write_section(ws, summary_table, "核心指标", 1)
+        next_row = write_section(ws, category_metrics["status_distribution"], "Category 状态分布", next_row)
+        write_section(ws, cp_summary_df, "Counterparty 覆盖率", next_row)
+        _finalize_sheet(ws, title_present=True, is_summary=True)
+
+        # ---- 02 Category 表现 ---------------------------------------------
+        ws_name = sanitize_sheet_name("02_Category表现")
+        ws = writer.book.create_sheet(ws_name)
+        next_row = write_section(
+            ws, category_metrics["per_category"],
+            f"逐类别表现（以 {config.reference_label} 为参照）", 1,
         )
-        write_dataframe(
-            writer, "04_confusion_pairs", category_metrics["confusion_pairs"],
-            title="Category 主要不一致流向",
-        )
-        write_confusion_sheet(writer, "05_confusion_count", category_metrics["confusion_count"],
+        next_row = write_section(ws, category_metrics["confusion_pairs"], "主要不一致流向", next_row)
+        write_section(ws, category_metrics["coverage_gaps"], "单边覆盖缺口分布", next_row)
+        apply_rate_color_scale(ws, header_row=2)
+        # Also apply to later sections
+        for marker in range(1, ws.max_row + 1):
+            pass  # color scale already applied from header_row 2
+        _finalize_sheet(ws, title_present=True)
+
+        # ---- 03-05 混淆矩阵 (unchanged) -----------------------------------
+        write_confusion_sheet(writer, "03_混淆矩阵_数量", category_metrics["confusion_count"],
                               "Category confusion matrix - count", percent=False)
-        write_confusion_sheet(writer, "06_confusion_row_pct", category_metrics["confusion_row_pct"],
-                              f"Category confusion matrix - row %（每个 {config.reference_label} 类别流向）", percent=True)
-        write_confusion_sheet(writer, "07_confusion_col_pct", category_metrics["confusion_col_pct"],
-                              f"Category confusion matrix - column %（每个 {config.candidate_label} 类别来源）", percent=True)
-        write_dataframe(writer, "08_coverage_gaps", category_metrics["coverage_gaps"],
-                        title="Category 单边覆盖缺口分布")
+        write_confusion_sheet(writer, "04_混淆矩阵_行占比", category_metrics["confusion_row_pct"],
+                              f"Confusion matrix - row %（{config.reference_label} → {config.candidate_label}）", percent=True)
+        write_confusion_sheet(writer, "05_混淆矩阵_列占比", category_metrics["confusion_col_pct"],
+                              f"Confusion matrix - column %（{config.candidate_label} ← {config.reference_label}）", percent=True)
 
-        cp_summary_df = pd.DataFrame(
-            [{"metric": key, "value": value} for key, value in cp_coverage.items()]
-        )
-        write_dataframe(writer, "09_counterparty_coverage", cp_summary_df,
-                        title="Counterparty 覆盖率")
-        write_dataframe(writer, "10_segment_analysis", segment_analysis, title="分群表现分析")
-        write_dataframe(writer, "11_status_distribution", category_metrics["status_distribution"],
-                        title="Category 状态分布")
-        write_dataframe(writer, "12_data_quality", data_quality["checks"], title="数据质量检查")
-        write_dataframe(writer, "12b_missing_patterns", data_quality["missing_patterns"],
-                        title="字段有效性组合分布")
-        write_dataframe(writer, "12c_category_variants", data_quality["category_variants"],
-                        title="同一标准化 Category 的原始写法变体")
-        write_dataframe(writer, "13_disagreement_details", disagreements,
-                        title="差异与单边覆盖缺口明细", max_rows=min(config.max_detail_rows, EXCEL_MAX_DATA_ROWS))
-        write_dataframe(writer, "14_qa_sample", qa_sample,
-                        title="按主要混淆对抽取的 QA 样本", max_rows=min(config.max_detail_rows, EXCEL_MAX_DATA_ROWS))
-        write_dataframe(writer, "15_all_comparisons", details,
-                        title="全量逐交易比对结果", max_rows=min(config.max_detail_rows, EXCEL_MAX_DATA_ROWS))
+        # ---- 06 分群分析 --------------------------------------------------
+        write_dataframe(writer, "06_分群分析", segment_analysis, title="分群表现分析")
+        ws = writer.book["06_分群分析"]
+        apply_rate_color_scale(ws, header_row=3)
 
+        # ---- 07 数据质量 --------------------------------------------------
+        ws_name = sanitize_sheet_name("07_数据质量")
+        ws = writer.book.create_sheet(ws_name)
+        next_row = write_section(ws, data_quality["checks"], "数据质量检查", 1)
+        next_row = write_section(ws, data_quality["missing_patterns"], "字段有效性组合分布", next_row)
+        write_section(ws, data_quality["category_variants"], "同一标准化 Category 的原始写法变体", next_row)
+        _finalize_sheet(ws, title_present=True)
+
+        # ---- 08 差异明细 --------------------------------------------------
+        ws_name = sanitize_sheet_name("08_差异明细")
+        ws = writer.book.create_sheet(ws_name)
+        next_row = write_section(ws, qa_sample, "QA 样本（按混淆对抽取）", 1, max_rows=max_detail)
+        next_row = write_section(ws, disagreements, "全部差异与覆盖缺口明细", next_row, max_rows=max_detail)
+        _finalize_sheet(ws, title_present=True)
+
+        # ---- 09 全量比对 --------------------------------------------------
+        write_dataframe(writer, "09_全量比对", details, title="全量逐交易比对结果", max_rows=max_detail)
+
+        # ---- Dashboard (last, placed at position 0) -----------------------
         write_dashboard(writer, category_summary, cp_coverage,
                         category_metrics["per_category"], category_metrics["confusion_pairs"], config)
 
-        # Sheet-specific formatting
-        for sheet_name in writer.book.sheetnames:
-            ws = writer.book[sheet_name]
-            if sheet_name in {"00_dashboard"}:
-                continue
-            title_present = (ws.cell(1, 1).fill.fill_type == "solid"
-                             and ws.cell(1, 1).value is not None)
-            header_row = 3 if title_present else 1
-            apply_percentage_formats(ws, header_row)
-            apply_integer_formats(ws, header_row)
-
-            if sheet_name in {"03_category_performance", "08_coverage_gaps", "10_segment_analysis"}:
-                apply_rate_color_scale(ws, header_row)
-
-            if sheet_name == "02_summary":
-                headers = {str(c.value): c.column for c in ws[header_row] if c.value is not None}
-                value_col = headers.get("value")
-                type_col = headers.get("value_type")
-                if value_col and type_col:
-                    for row in range(header_row + 1, ws.max_row + 1):
-                        value_type = ws.cell(row, type_col).value
-                        if value_type == "percentage":
-                            ws.cell(row, value_col).number_format = "0.00%"
-                        elif value_type == "count":
-                            ws.cell(row, value_col).number_format = "#,##0"
-                        else:
-                            ws.cell(row, value_col).number_format = "0.000"
-
         # Tab colors
         tab_colors = {
-            "00_dashboard": NAVY, "02_summary": BLUE,
-            "03_category_performance": GREEN, "04_confusion_pairs": ORANGE,
-            "05_confusion_count": RED, "09_counterparty_coverage": NAVY,
-            "13_disagreement_details": RED, "15_all_comparisons": GRAY,
+            "00_dashboard": NAVY, "01_指标汇总": BLUE,
+            "02_Category表现": GREEN, "03_混淆矩阵_数量": RED,
+            "04_混淆矩阵_行占比": ORANGE, "05_混淆矩阵_列占比": ORANGE,
+            "06_分群分析": DARK_BLUE, "07_数据质量": GRAY,
+            "08_差异明细": RED, "09_全量比对": GRAY,
         }
         for name, color in tab_colors.items():
             if name in writer.book.sheetnames:

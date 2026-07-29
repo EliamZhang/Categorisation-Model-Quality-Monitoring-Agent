@@ -120,10 +120,8 @@ class CategoryQualityMetricsTest(unittest.TestCase):
 
         wb = openpyxl.load_workbook(output, data_only=False)
         expected = {
-            "00_dashboard", "01_metric_dictionary", "02_summary",
-            "03_category_performance", "04_confusion_pairs",
-            "05_confusion_count", "06_confusion_row_pct", "07_confusion_col_pct",
-            "08_coverage_gaps", "09_counterparty_coverage",
+            "00_dashboard", "01_指标汇总", "02_Category表现",
+            "03_混淆矩阵_数量", "08_差异明细", "09_全量比对",
         }
         self.assertTrue(expected.issubset(set(wb.sheetnames)))
 
