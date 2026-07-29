@@ -1845,9 +1845,9 @@ def style_detail_header(ws, row: int, config: ReportConfig) -> None:
 
         cell.fill = PatternFill("solid", fgColor=fill_color)
         cell.font = Font(size=10, bold=True, color=WHITE)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = BORDER
-    ws.row_dimensions[row].height = 34
+    ws.row_dimensions[row].height = 28
 
 
 def apply_detail_conditional_formatting(ws, header_row: int, data_rows: int) -> None:
@@ -1952,7 +1952,6 @@ def format_detail_columns(ws, header_row: int, data_rows: int, config: ReportCon
     data_end = header_row + data_rows
 
     center_headers = ["排查优先级", "排查类型", "差异流向数量", "是否关键Category", "dr_cr"]
-    wrap_headers = ["差异流向", "text", "third_party", "counterparty", "classification_reason"]
 
     for header in center_headers:
         col = header_map.get(header)
@@ -1960,13 +1959,6 @@ def format_detail_columns(ws, header_row: int, data_rows: int, config: ReportCon
             continue
         for row in range(data_start, data_end + 1):
             ws.cell(row, col).alignment = Alignment(horizontal="center", vertical="center")
-
-    for header in wrap_headers:
-        col = header_map.get(header)
-        if not col:
-            continue
-        for row in range(data_start, data_end + 1):
-            ws.cell(row, col).alignment = Alignment(vertical="center", wrap_text=True)
 
     amount_col = header_map.get(config.amount_column)
     if amount_col:
@@ -2133,7 +2125,6 @@ def write_detail_sheet(
     style_detail_header(ws, 3, config)
 
     ws.sheet_view.showGridLines = False
-    ws.sheet_format.defaultRowHeight = 30
     ws.freeze_panes = "F4"
     ws.auto_filter.ref = f"A3:{get_column_letter(ws.max_column)}{max(3, ws.max_row)}"
 
