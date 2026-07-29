@@ -1,38 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-Category Comparison Quality Report
-==================================
+Simplified Category Difference Report
+====================================
 
-用于对两套交易分类结果进行系统比对，默认比较：
+用于比较两套 Category 输出，重点回答：
+1. 两边整体差异有多大？
+2. 哪些 Category 差异最大？
+3. 具体从哪个 Category 流向了哪个 Category？
+4. 哪些交易产生了差异？
+
+默认比较：
 - reference category: category（例如 illion）
 - candidate category: finv_category（例如 finv）
-- reference counterparty: third_party
-- candidate counterparty: counterparty
 
-输出一个包含 Dashboard、覆盖率、Agreement、类别级 Precision/Recall/F1、
-混淆矩阵、主要差异流向、Counterparty 覆盖率、分群表现、数据质量检查、
-差异明细和全量比对明细的 Excel 报告。
+输出 Excel 仅保留 4 个 Sheet：
+- 00_核心对比：关键指标、逐类别差异、主要差异流向
+- 01_热力图_数量：Category 对比数量矩阵
+- 02_热力图_行占比：以 reference Category 为基准的流向占比
+- 03_差异明细：仅输出不一致和单边缺失的交易
 
-重要说明
---------
-1. 当 reference 并非人工真值时，Precision / Recall / F1 只能理解为
-   "以 reference 为参照的一致性指标"，不能直接等同于真实模型准确率。
-2. Category 默认使用清洗、大小写归一和可选 alias 映射后进行比较。
-3. Counterparty 只看覆盖率，不做匹配度比对。
+说明：
+- reference 不一定是人工真值，因此本报告使用“一致率/差异率”，不使用 Accuracy、F1、Kappa 等容易被误解的指标。
+- Category 会先进行空值清洗、大小写/符号标准化，并可选使用 alias JSON 统一同义分类。
+- 热力图中的“(空)”表示该侧没有 Category。
 
 依赖：
     pandas
+    numpy
     openpyxl
 
 示例：
-    python category_quality_metrics.py --input classification_report.xlsx --output category_quality_report.xlsx
+    python category_quality_metrics_simplified.py \
+        --input classification_report.xlsx \
+        --output category_difference_report.xlsx
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -42,10 +48,9 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
-from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 # =====================================================================
@@ -54,31 +59,55 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 EXCEL_MAX_DATA_ROWS = 1_048_575
 DEFAULT_INPUT = Path(__file__).resolve().parent / "classification_report.xlsx"
-DEFAULT_OUTPUT = Path(__file__).resolve().parent / "category_quality_report.xlsx"
+DEFAULT_OUTPUT = Path(__file__).resolve().parent / "category_difference_report.xlsx"
 
-EMPTY_TOKENS = {
-    "", "nan", "none", "null", "<na>", "n/a", "na", "nat", "nil",
-}
+EMPTY_LABEL = "(空)"
+EMPTY_TOKENS = {"", "nan", "none", "null", "<na>", "n/a", "na", "nat", "nil"}
 
-CATEGORY_STATUS_ORDER = [
-    "exact_match", "normalized_match", "mismatch",
-    "reference_only", "candidate_only", "both_empty",
+STATUS_ORDER = [
+    "exact_match",
+    "normalized_match",
+    "mismatch",
+    "reference_only",
+    "candidate_only",
+    "both_empty",
 ]
 
 STATUS_CN = {
     "exact_match": "原始值一致",
     "normalized_match": "标准化后一致",
-    "mismatch": "不一致",
-    "reference_only": "仅参照方有值",
-    "candidate_only": "仅候选方有值",
+    "mismatch": "分类不一致",
+    "reference_only": "仅参照方有分类",
+    "candidate_only": "仅候选方有分类",
     "both_empty": "双方为空",
 }
+
+# 默认差异明细字段：存在则保留，不存在则自动跳过
+DEFAULT_DETAIL_COLUMNS = [
+    "user_id",
+    "sample_datetime",
+    "application_id",
+    "job_id",
+    "transaction_id",
+    "bank_account_id",
+    "transaction_date",
+    "amount",
+    "dr_cr",
+    "text",
+    "category",
+    "finv_category",
+    "third_party",
+    "counterparty",
+    "classification_status",
+    "classification_engine",
+    "classification_rule_id",
+    "classification_reason",
+]
 
 # Excel theme
 NAVY = "1F4E78"
 BLUE = "4472C4"
 LIGHT_BLUE = "D9EAF7"
-DARK_BLUE = "17365D"
 GREEN = "70AD47"
 LIGHT_GREEN = "E2F0D9"
 ORANGE = "ED7D31"
@@ -108,24 +137,17 @@ class ReportConfig:
 
     reference_category: str = "category"
     candidate_category: str = "finv_category"
-    reference_counterparty: str = "third_party"
-    candidate_counterparty: str = "counterparty"
-
     reference_label: str = "illion"
     candidate_label: str = "finv"
 
     alias_json: Path | None = None
     top_n: int = 20
-    min_category_support_for_rate_chart: int = 20
     max_detail_rows: int = EXCEL_MAX_DATA_ROWS
-    exclude_reference_counterparty_equal_category: bool = True
+    detail_columns: tuple[str, ...] = tuple(DEFAULT_DETAIL_COLUMNS)
 
     @property
     def required_columns(self) -> list[str]:
-        return [
-            self.reference_category, self.candidate_category,
-            self.reference_counterparty, self.candidate_counterparty,
-        ]
+        return [self.reference_category, self.candidate_category]
 
 
 # =====================================================================
@@ -136,14 +158,6 @@ def safe_div(numerator: float | int, denominator: float | int, default: float = 
     if denominator is None or denominator == 0 or pd.isna(denominator):
         return default
     return float(numerator) / float(denominator)
-
-
-def pct(numerator: float | int, denominator: float | int) -> float:
-    return safe_div(numerator, denominator, 0.0)
-
-
-def harmonic_mean(a: float, b: float) -> float:
-    return 0.0 if a + b == 0 else 2 * a * b / (a + b)
 
 
 def clean_scalar(value: Any) -> str | pd.NA:
@@ -164,9 +178,10 @@ def normalize_scalar(value: Any) -> str | pd.NA:
     cleaned = clean_scalar(value)
     if pd.isna(cleaned):
         return pd.NA
+
     text = str(cleaned).casefold()
     text = text.replace("&", " and ")
-    text = re.sub(r"[\-_\/]+", " ", text)
+    text = re.sub(r"[-_/]+", " ", text)
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text).strip()
     return text if text else pd.NA
@@ -176,21 +191,71 @@ def normalize_series(series: pd.Series) -> pd.Series:
     return series.map(normalize_scalar).astype("string")
 
 
-def as_python_scalar(value: Any) -> Any:
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        return None if np.isnan(value) else float(value)
-    if isinstance(value, (pd.Timestamp, datetime)):
-        return value.to_pydatetime() if isinstance(value, pd.Timestamp) else value
-    if pd.isna(value):
-        return None
-    return value
+def load_alias_mapping(path: Path | None) -> tuple[dict[str, str], dict[str, str]]:
+    """加载 Category alias。
+
+    支持两种 JSON：
+
+    1. canonical -> alias list
+       {
+         "Financial Institutions": ["Financial Services", "Finance"]
+       }
+
+    2. alias -> canonical
+       {
+         "Financial Services": "Financial Institutions"
+       }
+    """
+    if path is None:
+        return {}, {}
+    if not path.exists():
+        raise FileNotFoundError(f"Alias JSON 不存在: {path}")
+
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if not isinstance(payload, dict):
+        raise ValueError("Alias JSON 顶层必须是对象(dict)。")
+
+    alias_to_key: dict[str, str] = {}
+    canonical_display: dict[str, str] = {}
+
+    for key, value in payload.items():
+        if isinstance(value, list):
+            canonical_name = str(key)
+            canonical_key = normalize_scalar(canonical_name)
+            if pd.isna(canonical_key):
+                continue
+            canonical_key = str(canonical_key)
+            canonical_display[canonical_key] = canonical_name
+            alias_to_key[canonical_key] = canonical_key
+
+            for alias in value:
+                alias_key = normalize_scalar(alias)
+                if not pd.isna(alias_key):
+                    alias_to_key[str(alias_key)] = canonical_key
+        else:
+            alias_name = str(key)
+            canonical_name = str(value)
+            alias_key = normalize_scalar(alias_name)
+            canonical_key = normalize_scalar(canonical_name)
+            if pd.isna(alias_key) or pd.isna(canonical_key):
+                continue
+            alias_key = str(alias_key)
+            canonical_key = str(canonical_key)
+            alias_to_key[alias_key] = canonical_key
+            alias_to_key[canonical_key] = canonical_key
+            canonical_display[canonical_key] = canonical_name
+
+    return alias_to_key, canonical_display
 
 
-def sanitize_sheet_name(name: str) -> str:
-    name = re.sub(r"[\\/*?:\[\]]", "_", name)
-    return name[:31] or "Sheet"
+def apply_aliases(keys: pd.Series, alias_to_key: Mapping[str, str]) -> pd.Series:
+    if not alias_to_key:
+        return keys
+    return keys.map(
+        lambda x: alias_to_key.get(str(x), str(x)) if not pd.isna(x) else pd.NA
+    ).astype("string")
 
 
 def mode_or_first(values: pd.Series, fallback: str) -> str:
@@ -201,100 +266,25 @@ def mode_or_first(values: pd.Series, fallback: str) -> str:
     return str(modes.iloc[0] if not modes.empty else nonempty.iloc[0])
 
 
-def load_alias_mapping(path: Path | None) -> tuple[dict[str, str], dict[str, str]]:
-    if path is None:
-        return {}, {}
-    if not path.exists():
-        raise FileNotFoundError(f"Alias JSON 不存在: {path}")
-    with path.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
-    if not isinstance(payload, dict):
-        raise ValueError("Alias JSON 顶层必须是对象(dict)。")
-
-    alias_to_key: dict[str, str] = {}
-    key_to_display: dict[str, str] = {}
-    for key, value in payload.items():
-        if isinstance(value, list):
-            canonical_display = str(key)
-            canonical_key = normalize_scalar(canonical_display)
-            if pd.isna(canonical_key):
-                continue
-            canonical_key = str(canonical_key)
-            key_to_display[canonical_key] = canonical_display
-            alias_to_key[canonical_key] = canonical_key
-            for alias in value:
-                alias_key = normalize_scalar(alias)
-                if not pd.isna(alias_key):
-                    alias_to_key[str(alias_key)] = canonical_key
-        else:
-            alias_display = str(key)
-            canonical_display = str(value)
-            alias_key = normalize_scalar(alias_display)
-            canonical_key = normalize_scalar(canonical_display)
-            if pd.isna(alias_key) or pd.isna(canonical_key):
-                continue
-            alias_to_key[str(alias_key)] = str(canonical_key)
-            alias_to_key[str(canonical_key)] = str(canonical_key)
-            key_to_display[str(canonical_key)] = canonical_display
-    return alias_to_key, key_to_display
-
-
-def apply_aliases(keys: pd.Series, alias_to_key: Mapping[str, str]) -> pd.Series:
-    if not alias_to_key:
-        return keys
-    return keys.map(lambda x: alias_to_key.get(str(x), str(x)) if not pd.isna(x) else pd.NA).astype("string")
-
-
-# =====================================================================
-# Input and preparation
-# =====================================================================
-
-def validate_input_file(config: ReportConfig) -> None:
-    if not config.input_path.exists():
-        raise FileNotFoundError(f"输入文件不存在: {config.input_path}")
-    if config.input_path.suffix.lower() not in {".xlsx", ".xlsm", ".xls"}:
-        raise ValueError("输入文件必须是 Excel 文件。")
-    if config.top_n <= 0:
-        raise ValueError("top_n 必须大于 0。")
-    if config.max_detail_rows < 0:
-        raise ValueError("max_detail_rows 不能为负数。")
-
-
-def load_data(config: ReportConfig) -> pd.DataFrame:
-    validate_input_file(config)
-    try:
-        df = pd.read_excel(config.input_path, sheet_name=config.sheet_name)
-    except ValueError as exc:
-        xls = pd.ExcelFile(config.input_path)
-        raise ValueError(
-            f"找不到 sheet '{config.sheet_name}'。可用 sheets: {xls.sheet_names}"
-        ) from exc
-    missing = [col for col in config.required_columns if col not in df.columns]
-    if missing:
-        raise KeyError(
-            "输入数据缺少必要字段: " + ", ".join(missing) + f"。实际字段: {list(df.columns)}"
-        )
-    if df.empty:
-        raise ValueError("输入 sheet 没有数据行。")
-    return df
-
-
 def build_display_map(
-    ref_clean: pd.Series, cand_clean: pd.Series,
-    ref_key: pd.Series, cand_key: pd.Series,
+    ref_clean: pd.Series,
+    cand_clean: pd.Series,
+    ref_key: pd.Series,
+    cand_key: pd.Series,
     canonical_display: Mapping[str, str],
 ) -> dict[str, str]:
     combined = pd.DataFrame({
         "clean": pd.concat([ref_clean, cand_clean], ignore_index=True),
         "key": pd.concat([ref_key, cand_key], ignore_index=True),
     }).dropna()
-    display: dict[str, str] = dict(canonical_display)
+
+    display_map = dict(canonical_display)
     if not combined.empty:
         for key, group in combined.groupby("key", dropna=True):
             key_str = str(key)
-            if key_str not in display:
-                display[key_str] = mode_or_first(group["clean"], key_str)
-    return display
+            if key_str not in display_map:
+                display_map[key_str] = mode_or_first(group["clean"], key_str)
+    return display_map
 
 
 def map_display(keys: pd.Series, display_map: Mapping[str, str]) -> pd.Series:
@@ -303,933 +293,849 @@ def map_display(keys: pd.Series, display_map: Mapping[str, str]) -> pd.Series:
     ).astype("string")
 
 
+def sanitize_sheet_name(name: str) -> str:
+    name = re.sub(r"[\\/*?:\[\]]", "_", name)
+    return name[:31] or "Sheet"
+
+
+# =====================================================================
+# Input and preparation
+# =====================================================================
+
+def validate_config(config: ReportConfig) -> None:
+    if not config.input_path.exists():
+        raise FileNotFoundError(f"输入文件不存在: {config.input_path}")
+    if config.input_path.suffix.lower() not in {".xlsx", ".xlsm", ".xls"}:
+        raise ValueError("输入文件必须是 Excel 文件。")
+    if config.top_n <= 0:
+        raise ValueError("top_n 必须大于 0。")
+    if config.max_detail_rows < 0:
+        raise ValueError("max_detail_rows 不能小于 0。")
+
+
+def load_data(config: ReportConfig) -> pd.DataFrame:
+    validate_config(config)
+    try:
+        df = pd.read_excel(config.input_path, sheet_name=config.sheet_name)
+    except ValueError as exc:
+        xls = pd.ExcelFile(config.input_path)
+        raise ValueError(
+            f"找不到 Sheet '{config.sheet_name}'。可用 Sheets: {xls.sheet_names}"
+        ) from exc
+
+    missing = [col for col in config.required_columns if col not in df.columns]
+    if missing:
+        raise KeyError(
+            "输入数据缺少必要字段: " + ", ".join(missing)
+            + f"。实际字段: {list(df.columns)}"
+        )
+    if df.empty:
+        raise ValueError("输入 Sheet 没有数据行。")
+    return df
+
+
 def prepare_comparison_data(
-    raw_df: pd.DataFrame, config: ReportConfig,
-) -> tuple[pd.DataFrame, dict[str, str], dict[str, Any]]:
-    """生成统一清洗字段、Category 状态和 Counterparty 覆盖率标记."""
+    raw_df: pd.DataFrame,
+    config: ReportConfig,
+) -> tuple[pd.DataFrame, dict[str, str]]:
     df = raw_df.copy()
+    ref_col = config.reference_category
+    cand_col = config.candidate_category
+
     alias_to_key, canonical_display = load_alias_mapping(config.alias_json)
 
-    rc = config.reference_category
-    cc = config.candidate_category
-    rp = config.reference_counterparty
-    cp = config.candidate_counterparty
-
-    # Category
-    df["__ref_cat_clean"] = clean_series(df[rc])
-    df["__cand_cat_clean"] = clean_series(df[cc])
-    df["__ref_cat_key"] = apply_aliases(normalize_series(df["__ref_cat_clean"]), alias_to_key)
-    df["__cand_cat_key"] = apply_aliases(normalize_series(df["__cand_cat_clean"]), alias_to_key)
+    df["__ref_clean"] = clean_series(df[ref_col])
+    df["__cand_clean"] = clean_series(df[cand_col])
+    df["__ref_key"] = apply_aliases(normalize_series(df["__ref_clean"]), alias_to_key)
+    df["__cand_key"] = apply_aliases(normalize_series(df["__cand_clean"]), alias_to_key)
 
     display_map = build_display_map(
-        df["__ref_cat_clean"], df["__cand_cat_clean"],
-        df["__ref_cat_key"], df["__cand_cat_key"],
+        df["__ref_clean"],
+        df["__cand_clean"],
+        df["__ref_key"],
+        df["__cand_key"],
         canonical_display,
     )
-    df["__ref_cat_display"] = map_display(df["__ref_cat_key"], display_map)
-    df["__cand_cat_display"] = map_display(df["__cand_cat_key"], display_map)
 
-    ref_has = df["__ref_cat_key"].notna()
-    cand_has = df["__cand_cat_key"].notna()
-    both_cat = ref_has & cand_has
-    normalized_equal = both_cat & df["__ref_cat_key"].eq(df["__cand_cat_key"])
-    raw_equal = both_cat & df["__ref_cat_clean"].eq(df["__cand_cat_clean"])
+    df["__ref_display"] = map_display(df["__ref_key"], display_map)
+    df["__cand_display"] = map_display(df["__cand_key"], display_map)
 
-    category_status = np.select(
+    ref_has = df["__ref_key"].notna()
+    cand_has = df["__cand_key"].notna()
+    both = ref_has & cand_has
+    normalized_equal = both & df["__ref_key"].eq(df["__cand_key"])
+    raw_equal = both & df["__ref_clean"].eq(df["__cand_clean"])
+
+    status = np.select(
         [
             raw_equal,
             normalized_equal & ~raw_equal,
-            both_cat & ~normalized_equal,
+            both & ~normalized_equal,
             ref_has & ~cand_has,
             ~ref_has & cand_has,
         ],
-        ["exact_match", "normalized_match", "mismatch", "reference_only", "candidate_only"],
+        [
+            "exact_match",
+            "normalized_match",
+            "mismatch",
+            "reference_only",
+            "candidate_only",
+        ],
         default="both_empty",
     )
-    df["__category_status"] = pd.Categorical(category_status, categories=CATEGORY_STATUS_ORDER, ordered=True)
 
-    # Counterparty — coverage only (no matching)
-    df["__ref_cp_clean"] = clean_series(df[rp])
-    df["__cand_cp_clean"] = clean_series(df[cp])
-    df["__ref_cp_key"] = normalize_series(df["__ref_cp_clean"])
-    df["__cand_cp_key"] = normalize_series(df["__cand_cp_clean"])
+    df["__status"] = pd.Categorical(status, categories=STATUS_ORDER, ordered=True)
+    df["__status_cn"] = pd.Series(status, index=df.index).map(STATUS_CN)
 
-    ref_cp_eff = df["__ref_cp_key"].notna()
-    if config.exclude_reference_counterparty_equal_category:
-        polluted = (
-            ref_cp_eff
-            & df["__ref_cat_key"].notna()
-            & df["__ref_cp_key"].eq(df["__ref_cat_key"])
-        )
-        ref_cp_eff = ref_cp_eff & ~polluted
-    else:
-        polluted = pd.Series(False, index=df.index)
+    # 热力图中用“(空)”显式表示单边缺失
+    df["__ref_matrix"] = df["__ref_display"].fillna(EMPTY_LABEL)
+    df["__cand_matrix"] = df["__cand_display"].fillna(EMPTY_LABEL)
 
-    df["__ref_cp_effective"] = ref_cp_eff
-    df["__cand_cp_effective"] = df["__cand_cp_key"].notna()
-    df["__ref_cp_polluted"] = polluted
-
-    prep_meta = {
-        "alias_count": len(alias_to_key),
-        "reference_cp_polluted_count": int(polluted.sum()),
-    }
-    return df, display_map, prep_meta
+    return df, display_map
 
 
 # =====================================================================
-# Category metrics
+# Metrics
 # =====================================================================
 
-def confusion_matrices(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    joint = df["__ref_cat_key"].notna() & df["__cand_cat_key"].notna()
-    if not joint.any():
-        empty = pd.DataFrame()
-        return {"count": empty, "row_pct": empty, "col_pct": empty}
-
-    counts = pd.crosstab(
-        df.loc[joint, "__ref_cat_display"],
-        df.loc[joint, "__cand_cat_display"],
-        dropna=False,
-    ).astype(int)
-    counts = counts.loc[
-        counts.sum(axis=1).sort_values(ascending=False).index,
-        counts.sum(axis=0).sort_values(ascending=False).index,
-    ]
-    row_pct = counts.div(counts.sum(axis=1).replace(0, np.nan), axis=0).fillna(0.0)
-    col_pct = counts.div(counts.sum(axis=0).replace(0, np.nan), axis=1).fillna(0.0)
-    return {"count": counts, "row_pct": row_pct, "col_pct": col_pct}
-
-
-def cohen_kappa_from_confusion(counts: pd.DataFrame) -> float:
-    if counts.empty:
-        return 0.0
-    labels = sorted(set(counts.index) | set(counts.columns))
-    matrix = counts.reindex(index=labels, columns=labels, fill_value=0).to_numpy(dtype=float)
-    n = matrix.sum()
-    if n == 0:
-        return 0.0
-    observed = np.trace(matrix) / n
-    expected = np.dot(matrix.sum(axis=1), matrix.sum(axis=0)) / (n * n)
-    if math.isclose(1.0 - expected, 0.0):
-        return 1.0 if math.isclose(observed, 1.0) else 0.0
-    return float((observed - expected) / (1.0 - expected))
-
-
-def multiclass_mcc_from_confusion(counts: pd.DataFrame) -> float:
-    if counts.empty:
-        return 0.0
-    labels = sorted(set(counts.index) | set(counts.columns))
-    c = counts.reindex(index=labels, columns=labels, fill_value=0).to_numpy(dtype=float)
-    n = c.sum()
-    if n == 0:
-        return 0.0
-    t = c.sum(axis=1)
-    p = c.sum(axis=0)
-    numerator = np.trace(c) * n - np.dot(t, p)
-    denominator = math.sqrt((n * n - np.dot(p, p)) * (n * n - np.dot(t, t)))
-    return float(numerator / denominator) if denominator else 0.0
-
-
-def compute_per_category(df: pd.DataFrame, display_map: Mapping[str, str]) -> pd.DataFrame:
-    columns = [
-        "rank_by_mismatch_count", "category_key", "category",
-        "reference_support", "candidate_support",
-        "true_positive", "false_positive", "false_negative",
-        "precision_vs_reference", "recall_vs_reference", "f1_vs_reference",
-        "joint_nonempty_for_reference", "mismatch_count",
-        "candidate_missing_count", "reference_missing_count",
-        "mismatch_rate_when_both_nonempty", "broad_gap_rate_vs_reference",
-        "support_share_reference", "support_share_candidate",
-        "support_delta_candidate_minus_reference", "top_candidate_mismatch_categories",
-    ]
-    ref_key = df["__ref_cat_key"]
-    cand_key = df["__cand_cat_key"]
-    labels = sorted(
-        set(ref_key.dropna().astype(str)) | set(cand_key.dropna().astype(str)),
-        key=lambda key: display_map.get(key, key).casefold(),
-    )
-
-    rows: list[dict[str, Any]] = []
-    for key in labels:
-        ref_mask = ref_key.eq(key)
-        cand_mask = cand_key.eq(key)
-        tp = int((ref_mask & cand_mask).sum())
-        support_ref = int(ref_mask.sum())
-        support_candidate = int(cand_mask.sum())
-        fp = support_candidate - tp
-        fn = support_ref - tp
-        precision = pct(tp, tp + fp)
-        recall = pct(tp, tp + fn)
-        f1 = harmonic_mean(precision, recall)
-
-        ref_joint = ref_mask & cand_key.notna()
-        mismatch = int((ref_joint & ~cand_mask).sum())
-        candidate_missing = int((ref_mask & cand_key.isna()).sum())
-        reference_missing = int((cand_mask & ref_key.isna()).sum())
-        mismatch_plus_missing = mismatch + candidate_missing
-
-        mismatch_targets = (
-            df.loc[ref_joint & ~cand_mask, "__cand_cat_display"]
-            .value_counts(dropna=False).head(3)
-        )
-        top_targets = "; ".join(
-            f"{target}: {int(count):,}"
-            for target, count in mismatch_targets.items()
-        ) or "-"
-
-        rows.append({
-            "category_key": key,
-            "category": display_map.get(key, key),
-            "reference_support": support_ref,
-            "candidate_support": support_candidate,
-            "true_positive": tp, "false_positive": fp, "false_negative": fn,
-            "precision_vs_reference": precision,
-            "recall_vs_reference": recall,
-            "f1_vs_reference": f1,
-            "joint_nonempty_for_reference": int(ref_joint.sum()),
-            "mismatch_count": mismatch,
-            "candidate_missing_count": candidate_missing,
-            "reference_missing_count": reference_missing,
-            "mismatch_rate_when_both_nonempty": pct(mismatch, ref_joint.sum()),
-            "broad_gap_rate_vs_reference": pct(mismatch_plus_missing, support_ref),
-            "support_share_reference": pct(support_ref, ref_key.notna().sum()),
-            "support_share_candidate": pct(support_candidate, cand_key.notna().sum()),
-            "support_delta_candidate_minus_reference": support_candidate - support_ref,
-            "top_candidate_mismatch_categories": top_targets,
-        })
-
-    if not rows:
-        return pd.DataFrame(columns=columns)
-
-    result = pd.DataFrame(rows)
-    result = result.sort_values(
-        ["mismatch_count", "reference_support"], ascending=[False, False]
-    ).reset_index(drop=True)
-    result.insert(0, "rank_by_mismatch_count", np.arange(1, len(result) + 1))
-    return result.reindex(columns=columns)
-
-
-def compute_confusion_pairs(df: pd.DataFrame) -> pd.DataFrame:
-    mismatch = df["__category_status"].astype("string").eq("mismatch")
-    if not mismatch.any():
-        return pd.DataFrame(columns=[
-            "rank", "reference_category", "candidate_category", "count",
-            "share_of_all_mismatches", "share_within_reference_category",
-            "share_within_candidate_category",
-        ])
-
-    pairs = (
-        df.loc[mismatch]
-        .groupby(["__ref_cat_display", "__cand_cat_display"], dropna=False)
-        .size().rename("count").reset_index()
-        .rename(columns={"__ref_cat_display": "reference_category", "__cand_cat_display": "candidate_category"})
-    )
-    total_mismatch = int(pairs["count"].sum())
-    ref_totals = pairs.groupby("reference_category")["count"].transform("sum")
-    cand_totals = pairs.groupby("candidate_category")["count"].transform("sum")
-    pairs["share_of_all_mismatches"] = pairs["count"] / total_mismatch
-    pairs["share_within_reference_category"] = pairs["count"] / ref_totals
-    pairs["share_within_candidate_category"] = pairs["count"] / cand_totals
-    pairs = pairs.sort_values("count", ascending=False).reset_index(drop=True)
-    pairs.insert(0, "rank", np.arange(1, len(pairs) + 1))
-    return pairs
-
-
-def compute_coverage_gaps(df: pd.DataFrame) -> pd.DataFrame:
-    status = df["__category_status"].astype("string")
-    frames: list[pd.DataFrame] = []
-    for gap_status, source_col, output_side in [
-        ("reference_only", "__ref_cat_display", "reference_only"),
-        ("candidate_only", "__cand_cat_display", "candidate_only"),
-    ]:
-        subset = df.loc[status.eq(gap_status), source_col]
-        if subset.empty:
-            continue
-        counts = subset.value_counts(dropna=False).rename("gap_count").reset_index()
-        counts.columns = ["category", "gap_count"]
-        counts.insert(0, "gap_side", output_side)
-        counts["share_within_gap_side"] = counts["gap_count"] / counts["gap_count"].sum()
-        if output_side == "reference_only":
-            total_by_cat = df["__ref_cat_display"].value_counts(dropna=False)
-        else:
-            total_by_cat = df["__cand_cat_display"].value_counts(dropna=False)
-        counts["category_total_on_available_side"] = counts["category"].map(total_by_cat).fillna(0).astype(int)
-        counts["gap_rate_within_category"] = (
-            counts["gap_count"] / counts["category_total_on_available_side"].replace(0, np.nan)
-        ).fillna(0.0)
-        frames.append(counts)
-
-    if not frames:
-        return pd.DataFrame(columns=[
-            "gap_side", "category", "gap_count", "share_within_gap_side",
-            "category_total_on_available_side", "gap_rate_within_category",
-        ])
-    return pd.concat(frames, ignore_index=True).sort_values(
-        ["gap_side", "gap_count"], ascending=[True, False]
-    )
-
-
-def compute_counterparty_coverage(df: pd.DataFrame, config: ReportConfig) -> dict[str, Any]:
+def compute_summary(df: pd.DataFrame, config: ReportConfig) -> tuple[dict[str, Any], pd.DataFrame]:
     n = len(df)
-    ref_eff = df["__ref_cp_effective"].astype(bool)
-    cand_eff = df["__cand_cp_effective"].astype(bool)
-    return {
-        "reference_counterparty_count": int(ref_eff.sum()),
-        "reference_counterparty_coverage": pct(ref_eff.sum(), n),
-        "candidate_counterparty_count": int(cand_eff.sum()),
-        "candidate_counterparty_coverage": pct(cand_eff.sum(), n),
-        "counterparty_coverage_delta": pct(cand_eff.sum(), n) - pct(ref_eff.sum(), n),
-        "reference_counterparty_polluted_count": int(df["__ref_cp_polluted"].sum()),
-    }
-
-
-def compute_category_metrics(
-    df: pd.DataFrame, display_map: Mapping[str, str], config: ReportConfig,
-) -> dict[str, Any]:
-    n = len(df)
-    ref_has = df["__ref_cat_key"].notna()
-    cand_has = df["__cand_cat_key"].notna()
-    joint = ref_has & cand_has
+    ref_has = df["__ref_key"].notna()
+    cand_has = df["__cand_key"].notna()
+    both = ref_has & cand_has
     union = ref_has | cand_has
-    status = df["__category_status"].astype("string")
+    status = df["__status"].astype("string")
 
-    exact = status.eq("exact_match")
-    normalized = status.eq("normalized_match")
-    matched = exact | normalized
+    matched = status.isin(["exact_match", "normalized_match"])
     mismatch = status.eq("mismatch")
-    reference_only = status.eq("reference_only")
-    candidate_only = status.eq("candidate_only")
-
-    matrices = confusion_matrices(df)
-    per_category = compute_per_category(df, display_map)
-    confusion_pairs = compute_confusion_pairs(df)
-    coverage_gaps = compute_coverage_gaps(df)
-
-    joint_agreement = pct(matched.sum(), joint.sum())
-    coverage_adjusted_agreement = pct(matched.sum(), union.sum())
-    all_row_agreement_including_both_empty = pct(matched.sum() + status.eq("both_empty").sum(), n)
-
-    if per_category.empty:
-        macro_precision = macro_recall = macro_f1 = weighted_f1 = 0.0
-    else:
-        macro_precision = float(per_category["precision_vs_reference"].mean())
-        macro_recall = float(per_category["recall_vs_reference"].mean())
-        macro_f1 = float(per_category["f1_vs_reference"].mean())
-        weights = per_category["reference_support"].to_numpy(dtype=float)
-        weighted_f1 = (
-            float(np.average(per_category["f1_vs_reference"], weights=weights))
-            if weights.sum() > 0 else 0.0
-        )
+    ref_only = status.eq("reference_only")
+    cand_only = status.eq("candidate_only")
+    both_empty = status.eq("both_empty")
 
     summary = {
         "total_rows": n,
-        "reference_category_count": int(ref_has.sum()),
-        "reference_category_coverage": pct(ref_has.sum(), n),
-        "candidate_category_count": int(cand_has.sum()),
-        "candidate_category_coverage": pct(cand_has.sum(), n),
-        "category_coverage_delta": pct(cand_has.sum(), n) - pct(ref_has.sum(), n),
-        "both_category_nonempty_count": int(joint.sum()),
-        "either_category_nonempty_count": int(union.sum()),
-        "raw_exact_match_count": int(exact.sum()),
-        "normalized_only_match_count": int(normalized.sum()),
-        "normalized_match_count": int(matched.sum()),
+        "reference_nonempty": int(ref_has.sum()),
+        "candidate_nonempty": int(cand_has.sum()),
+        "reference_coverage": safe_div(ref_has.sum(), n),
+        "candidate_coverage": safe_div(cand_has.sum(), n),
+        "coverage_delta": safe_div(cand_has.sum(), n) - safe_div(ref_has.sum(), n),
+        "both_nonempty": int(both.sum()),
+        "matched_count": int(matched.sum()),
         "mismatch_count": int(mismatch.sum()),
-        "reference_only_count": int(reference_only.sum()),
-        "candidate_only_count": int(candidate_only.sum()),
-        "both_empty_count": int(status.eq("both_empty").sum()),
-        "joint_agreement_rate": joint_agreement,
-        "joint_mismatch_rate": pct(mismatch.sum(), joint.sum()),
-        "coverage_adjusted_agreement_rate": coverage_adjusted_agreement,
-        "all_row_agreement_including_both_empty": all_row_agreement_including_both_empty,
-        "reference_only_rate_vs_reference_nonempty": pct(reference_only.sum(), ref_has.sum()),
-        "candidate_only_rate_vs_candidate_nonempty": pct(candidate_only.sum(), cand_has.sum()),
-        "reference_empty_candidate_coverage": pct(candidate_only.sum(), (~ref_has).sum()),
-        "candidate_empty_reference_coverage": pct(reference_only.sum(), (~cand_has).sum()),
-        "macro_precision_vs_reference": macro_precision,
-        "macro_recall_vs_reference": macro_recall,
-        "macro_f1_vs_reference": macro_f1,
-        "weighted_f1_vs_reference": weighted_f1,
-        "cohen_kappa": cohen_kappa_from_confusion(matrices["count"]),
-        "multiclass_mcc": multiclass_mcc_from_confusion(matrices["count"]),
-        "reference_unique_categories": int(df["__ref_cat_key"].nunique(dropna=True)),
-        "candidate_unique_categories": int(df["__cand_cat_key"].nunique(dropna=True)),
-    }
-    return {
-        "summary": summary,
-        "per_category": per_category,
-        "confusion_pairs": confusion_pairs,
-        "coverage_gaps": coverage_gaps,
-        "confusion_count": matrices["count"],
-        "confusion_row_pct": matrices["row_pct"],
-        "confusion_col_pct": matrices["col_pct"],
-        "status_distribution": build_status_distribution(df),
+        "reference_only_count": int(ref_only.sum()),
+        "candidate_only_count": int(cand_only.sum()),
+        "both_empty_count": int(both_empty.sum()),
+        "agreement_rate_when_both_nonempty": safe_div(matched.sum(), both.sum()),
+        "mismatch_rate_when_both_nonempty": safe_div(mismatch.sum(), both.sum()),
+        "coverage_adjusted_agreement": safe_div(matched.sum(), union.sum()),
+        "all_difference_count": int((mismatch | ref_only | cand_only).sum()),
+        "all_difference_rate_vs_union": safe_div(
+            (mismatch | ref_only | cand_only).sum(), union.sum()
+        ),
+        "reference_unique_categories": int(df["__ref_key"].nunique(dropna=True)),
+        "candidate_unique_categories": int(df["__cand_key"].nunique(dropna=True)),
     }
 
-
-# =====================================================================
-# Status, segments and data quality
-# =====================================================================
-
-def build_status_distribution(df: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    counts = df["__category_status"].astype("string").value_counts(dropna=False)
-    for status in CATEGORY_STATUS_ORDER:
-        count = int(counts.get(status, 0))
-        rows.append({
-            "comparison": "category",
-            "status": status,
-            "status_cn": STATUS_CN.get(status, status),
-            "count": count,
-            "share_of_all_rows": pct(count, len(df)),
-        })
-    return pd.DataFrame(rows)
-
-
-# =====================================================================
-# Details
-# =====================================================================
-
-def build_detail_table(df: pd.DataFrame, config: ReportConfig) -> pd.DataFrame:
-    comparison_cols = [
-        config.reference_category, config.candidate_category,
-        config.reference_counterparty, config.candidate_counterparty,
-    ]
-    available = [col for col in comparison_cols if col in df.columns]
-    result = df[available].copy()
-    result["reference_category_clean"] = df["__ref_cat_clean"]
-    result["candidate_category_clean"] = df["__cand_cat_clean"]
-    result["reference_category_normalized"] = df["__ref_cat_display"]
-    result["candidate_category_normalized"] = df["__cand_cat_display"]
-    result["category_comparison_status"] = df["__category_status"].astype("string")
-    result["category_comparison_status_cn"] = result["category_comparison_status"].map(STATUS_CN)
-    result["reference_counterparty_coverage"] = df["__ref_cp_effective"]
-    result["candidate_counterparty_coverage"] = df["__cand_cp_effective"]
-    result["reference_counterparty_polluted"] = df["__ref_cp_polluted"]
-    return result
-
-
-# =====================================================================
-# Summary table
-# =====================================================================
-
-def build_summary_table(
-    category_summary: Mapping[str, Any],
-    cp_coverage: Mapping[str, Any],
-    config: ReportConfig,
-) -> pd.DataFrame:
     r = config.reference_label
     c = config.candidate_label
-    rows: list[dict[str, Any]] = []
+    rows = [
+        {
+            "指标": "总交易数",
+            "结果": n,
+            "分子": n,
+            "分母": pd.NA,
+            "说明": "输入数据总行数",
+            "格式": "count",
+        },
+        {
+            "指标": f"{r} Category 覆盖率",
+            "结果": summary["reference_coverage"],
+            "分子": summary["reference_nonempty"],
+            "分母": n,
+            "说明": f"{config.reference_category} 标准化后非空",
+            "格式": "percentage",
+        },
+        {
+            "指标": f"{c} Category 覆盖率",
+            "结果": summary["candidate_coverage"],
+            "分子": summary["candidate_nonempty"],
+            "分母": n,
+            "说明": f"{config.candidate_category} 标准化后非空",
+            "格式": "percentage",
+        },
+        {
+            "指标": f"{c} - {r} 覆盖率差",
+            "结果": summary["coverage_delta"],
+            "分子": pd.NA,
+            "分母": pd.NA,
+            "说明": "正值表示候选方覆盖率更高",
+            "格式": "percentage",
+        },
+        {
+            "指标": "双方非空时一致率",
+            "结果": summary["agreement_rate_when_both_nonempty"],
+            "分子": summary["matched_count"],
+            "分母": summary["both_nonempty"],
+            "说明": "含原始值一致和标准化后一致",
+            "格式": "percentage",
+        },
+        {
+            "指标": "双方非空时差异率",
+            "结果": summary["mismatch_rate_when_both_nonempty"],
+            "分子": summary["mismatch_count"],
+            "分母": summary["both_nonempty"],
+            "说明": "双方均有 Category，但 Category 不同",
+            "格式": "percentage",
+        },
+        {
+            "指标": "覆盖调整后一致率",
+            "结果": summary["coverage_adjusted_agreement"],
+            "分子": summary["matched_count"],
+            "分母": int(union.sum()),
+            "说明": "将单边缺失也计入差异",
+            "格式": "percentage",
+        },
+        {
+            "指标": "Category 差异总数",
+            "结果": summary["all_difference_count"],
+            "分子": summary["all_difference_count"],
+            "分母": int(union.sum()),
+            "说明": "分类不一致 + 仅参照方有值 + 仅候选方有值",
+            "格式": "count",
+        },
+        {
+            "指标": f"仅 {r} 有 Category",
+            "结果": summary["reference_only_count"],
+            "分子": summary["reference_only_count"],
+            "分母": summary["reference_nonempty"],
+            "说明": f"{c} 侧为空",
+            "格式": "count",
+        },
+        {
+            "指标": f"仅 {c} 有 Category",
+            "结果": summary["candidate_only_count"],
+            "分子": summary["candidate_only_count"],
+            "分母": summary["candidate_nonempty"],
+            "说明": f"{r} 侧为空",
+            "格式": "count",
+        },
+        {
+            "指标": "双方均为空",
+            "结果": summary["both_empty_count"],
+            "分子": summary["both_empty_count"],
+            "分母": n,
+            "说明": "不进入热力图和差异明细",
+            "格式": "count",
+        },
+    ]
 
-    def add(section: str, metric: str, value: float | int, value_type: str,
-            numerator: int | float | None, denominator: int | float | None, note: str) -> None:
+    return summary, pd.DataFrame(rows)
+
+
+def compute_category_comparison(
+    df: pd.DataFrame,
+    display_map: Mapping[str, str],
+) -> pd.DataFrame:
+    ref_key = df["__ref_key"]
+    cand_key = df["__cand_key"]
+
+    keys = sorted(
+        set(ref_key.dropna().astype(str)) | set(cand_key.dropna().astype(str)),
+        key=lambda x: display_map.get(x, x).casefold(),
+    )
+
+    rows: list[dict[str, Any]] = []
+    for key in keys:
+        ref_mask = ref_key.eq(key)
+        cand_mask = cand_key.eq(key)
+        both_same = ref_mask & cand_mask
+
+        ref_to_other = ref_mask & cand_key.notna() & ~cand_mask
+        ref_to_empty = ref_mask & cand_key.isna()
+        other_to_candidate = cand_mask & ref_key.notna() & ~ref_mask
+        empty_to_candidate = cand_mask & ref_key.isna()
+
+        ref_support = int(ref_mask.sum())
+        cand_support = int(cand_mask.sum())
+        matched = int(both_same.sum())
+        mismatch_out = int(ref_to_other.sum())
+        candidate_missing = int(ref_to_empty.sum())
+
+        top_targets = (
+            df.loc[ref_to_other, "__cand_display"]
+            .value_counts(dropna=False)
+            .head(3)
+        )
+        top_target_text = "; ".join(
+            f"{target}: {int(count):,}" for target, count in top_targets.items()
+        ) or "-"
+
         rows.append({
-            "section": section, "metric": metric, "value": value, "value_type": value_type,
-            "numerator": numerator, "denominator": denominator, "note": note,
+            "Category": display_map.get(key, key),
+            "参照方数量": ref_support,
+            "候选方数量": cand_support,
+            "数量差_候选减参照": cand_support - ref_support,
+            "一致数量": matched,
+            "流向其他Category": mismatch_out,
+            "候选方缺失": candidate_missing,
+            "来自其他Category": int(other_to_candidate.sum()),
+            "参照方缺失": int(empty_to_candidate.sum()),
+            "参照方Category一致率": safe_div(matched, ref_support),
+            "双方非空时一致率": safe_div(matched, matched + mismatch_out),
+            "差异及缺失率": safe_div(mismatch_out + candidate_missing, ref_support),
+            "主要差异去向": top_target_text,
         })
 
-    n = category_summary["total_rows"]
-    add("样本", "总交易行数", n, "count", n, None, "输入 sheet 数据行数")
-    add("Category覆盖", f"{r} Category覆盖率", category_summary["reference_category_coverage"], "percentage",
-        category_summary["reference_category_count"], n, "Category标准化后非空")
-    add("Category覆盖", f"{c} Category覆盖率", category_summary["candidate_category_coverage"], "percentage",
-        category_summary["candidate_category_count"], n, "Category标准化后非空")
-    add("Category覆盖", f"{c}-{r}覆盖率差", category_summary["category_coverage_delta"], "percentage",
-        None, None, "正值表示候选方覆盖更高")
-    add("Category一致性", "双方非空时一致率", category_summary["joint_agreement_rate"], "percentage",
-        category_summary["normalized_match_count"], category_summary["both_category_nonempty_count"], "含标准化后一致")
-    add("Category一致性", "双方非空时不一致率", category_summary["joint_mismatch_rate"], "percentage",
-        category_summary["mismatch_count"], category_summary["both_category_nonempty_count"], "双方有值但类别不同")
-    add("Category一致性", "覆盖调整后一致率", category_summary["coverage_adjusted_agreement_rate"], "percentage",
-        category_summary["normalized_match_count"], category_summary["either_category_nonempty_count"], "把单边缺失作为未一致")
-    add("Category一致性", "仅标准化后匹配", category_summary["normalized_only_match_count"], "count",
-        category_summary["normalized_only_match_count"], None, "原始字符串不同，但大小写/空白/alias处理后相同")
-    add("Category覆盖缺口", f"仅{r}有Category", category_summary["reference_only_count"], "count",
-        category_summary["reference_only_count"], None, "候选方为空")
-    add("Category覆盖缺口", f"仅{c}有Category", category_summary["candidate_only_count"], "count",
-        category_summary["candidate_only_count"], None, "参照方为空")
-    add("方向性分类指标", "Macro Precision", category_summary["macro_precision_vs_reference"], "percentage",
-        None, None, f"以{r}为参照")
-    add("方向性分类指标", "Macro Recall", category_summary["macro_recall_vs_reference"], "percentage",
-        None, None, f"以{r}为参照")
-    add("方向性分类指标", "Macro F1", category_summary["macro_f1_vs_reference"], "percentage",
-        None, None, f"以{r}为参照")
-    add("方向性分类指标", "Weighted F1", category_summary["weighted_f1_vs_reference"], "percentage",
-        None, None, f"以{r}为参照")
-    add("一致性校正", "Cohen's Kappa", category_summary["cohen_kappa"], "decimal",
-        None, None, "校正随机一致概率")
-    add("一致性校正", "Multiclass MCC", category_summary["multiclass_mcc"], "decimal",
-        None, None, "多分类相关性指标")
-    add("Counterparty覆盖", f"{r} Counterparty覆盖率", cp_coverage["reference_counterparty_coverage"], "percentage",
-        cp_coverage["reference_counterparty_count"], n, "参照方有效Counterparty")
-    add("Counterparty覆盖", f"{c} Counterparty覆盖率", cp_coverage["candidate_counterparty_coverage"], "percentage",
-        cp_coverage["candidate_counterparty_count"], n, "候选方Counterparty非空")
-    add("Counterparty覆盖", f"{c}-{r}覆盖率差", cp_coverage["counterparty_coverage_delta"], "percentage",
-        None, None, "正值表示候选方覆盖更高")
-    add("Counterparty数据质量", f"{r} Counterparty污染数", cp_coverage["reference_counterparty_polluted_count"], "count",
-        cp_coverage["reference_counterparty_polluted_count"], None, "Counterparty标准化后等于自身Category")
+    if not rows:
+        return pd.DataFrame(columns=[
+            "Category", "参照方数量", "候选方数量", "数量差_候选减参照",
+            "一致数量", "流向其他Category", "候选方缺失", "来自其他Category",
+            "参照方缺失", "参照方Category一致率", "双方非空时一致率",
+            "差异及缺失率", "主要差异去向",
+        ])
 
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    return result.sort_values(
+        ["流向其他Category", "候选方缺失", "参照方数量"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+
+def compute_difference_flows(df: pd.DataFrame) -> pd.DataFrame:
+    status = df["__status"].astype("string")
+    difference = status.isin(["mismatch", "reference_only", "candidate_only"])
+
+    if not difference.any():
+        return pd.DataFrame(columns=[
+            "排名", "参照方Category", "候选方Category", "差异类型",
+            "数量", "占全部差异比例", "占参照方该Category比例",
+        ])
+
+    subset = df.loc[difference, ["__ref_matrix", "__cand_matrix", "__status_cn"]].copy()
+    flows = (
+        subset.groupby(["__ref_matrix", "__cand_matrix", "__status_cn"], dropna=False)
+        .size()
+        .rename("数量")
+        .reset_index()
+        .rename(columns={
+            "__ref_matrix": "参照方Category",
+            "__cand_matrix": "候选方Category",
+            "__status_cn": "差异类型",
+        })
+    )
+
+    total_difference = int(flows["数量"].sum())
+    ref_total = (
+        df.loc[df["__ref_matrix"].ne(EMPTY_LABEL), "__ref_matrix"]
+        .value_counts(dropna=False)
+    )
+
+    flows["占全部差异比例"] = flows["数量"] / total_difference
+    flows["占参照方该Category比例"] = flows.apply(
+        lambda row: safe_div(
+            row["数量"],
+            ref_total.get(row["参照方Category"], 0),
+        ) if row["参照方Category"] != EMPTY_LABEL else pd.NA,
+        axis=1,
+    )
+
+    flows = flows.sort_values("数量", ascending=False).reset_index(drop=True)
+    flows.insert(0, "排名", np.arange(1, len(flows) + 1))
+    return flows
+
+
+def compute_matrices(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    # 双方均为空没有比较价值，因此不进入矩阵
+    matrix_source = df.loc[
+        ~(df["__ref_matrix"].eq(EMPTY_LABEL) & df["__cand_matrix"].eq(EMPTY_LABEL))
+    ]
+
+    if matrix_source.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    counts = pd.crosstab(
+        matrix_source["__ref_matrix"],
+        matrix_source["__cand_matrix"],
+        dropna=False,
+    ).astype(int)
+
+    # 按参照方和候选方支持度排序；空值固定放最后
+    row_order = list(counts.sum(axis=1).sort_values(ascending=False).index)
+    col_order = list(counts.sum(axis=0).sort_values(ascending=False).index)
+    if EMPTY_LABEL in row_order:
+        row_order = [x for x in row_order if x != EMPTY_LABEL] + [EMPTY_LABEL]
+    if EMPTY_LABEL in col_order:
+        col_order = [x for x in col_order if x != EMPTY_LABEL] + [EMPTY_LABEL]
+
+    counts = counts.loc[row_order, col_order]
+    row_pct = counts.div(counts.sum(axis=1).replace(0, np.nan), axis=0).fillna(0.0)
+    return counts, row_pct
+
+
+def build_difference_details(df: pd.DataFrame, config: ReportConfig) -> pd.DataFrame:
+    status = df["__status"].astype("string")
+    difference = status.isin(["mismatch", "reference_only", "candidate_only"])
+    diff_df = df.loc[difference].copy()
+
+    preferred_columns = list(dict.fromkeys([
+        *config.detail_columns,
+        config.reference_category,
+        config.candidate_category,
+    ]))
+    available = [col for col in preferred_columns if col in diff_df.columns]
+
+    result = diff_df[available].copy()
+    result["参照方Category_标准化"] = diff_df["__ref_display"]
+    result["候选方Category_标准化"] = diff_df["__cand_display"]
+    result["Category比对状态"] = diff_df["__status_cn"]
+
+    # 让核心比对字段靠前
+    leading = [
+        "Category比对状态",
+        config.reference_category,
+        config.candidate_category,
+        "参照方Category_标准化",
+        "候选方Category_标准化",
+    ]
+    leading = [c for c in leading if c in result.columns]
+    remaining = [c for c in result.columns if c not in leading]
+    return result[leading + remaining]
 
 
 # =====================================================================
-# Excel writing helpers
+# Excel formatting helpers
 # =====================================================================
 
-SECTION_HEADER_FILL = PatternFill("solid", fgColor=NAVY)
-SECTION_TITLE_FONT = Font(name="微软雅黑", size=13, bold=True, color=WHITE)
+def style_title(
+    ws,
+    title: str,
+    subtitle: str | None = None,
+    end_col: int | None = None,
+) -> None:
+    end_col = max(4, end_col or ws.max_column)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_col)
+    cell = ws.cell(1, 1, title)
+    cell.fill = PatternFill("solid", fgColor=NAVY)
+    cell.font = Font(name="微软雅黑", size=16, bold=True, color=WHITE)
+    cell.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    if subtitle:
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=end_col)
+        sub = ws.cell(2, 1, subtitle)
+        sub.font = Font(name="微软雅黑", size=10, italic=True, color=NAVY)
+        sub.alignment = Alignment(horizontal="left", vertical="center")
 
 
-def write_section(
-    ws, df: pd.DataFrame, title: str, start_row: int, *,
-    max_rows: int = EXCEL_MAX_DATA_ROWS,
-) -> int:
-    """Write a titled DataFrame block starting at *start_row*.
-
-    Returns the row number immediately after this block (next available row).
-    """
-    output = df.copy()
-    if max_rows >= 0 and len(output) > max_rows:
-        output = output.head(max_rows)
-
-    if output.empty and len(output.columns) == 0:
-        output = pd.DataFrame({"message": ["No data"]})
-
-    # Section title
-    ws.merge_cells(start_row=start_row, start_column=1,
-                   end_row=start_row, end_column=max(1, len(output.columns)))
-    title_cell = ws.cell(start_row, 1, title)
-    title_cell.font = SECTION_TITLE_FONT
-    title_cell.fill = SECTION_HEADER_FILL
-    title_cell.alignment = Alignment(horizontal="left", vertical="center")
-    ws.row_dimensions[start_row].height = 24
-
-    # Write DataFrame below title
-    header_row = start_row + 1
-    _write_df_to_ws(ws, output, header_row)
-
-    style_header_row(ws, header_row)
-
-    # Apply formatting to this section's data rows
-    _apply_section_formats(ws, header_row, data_start=header_row + 1, data_end=header_row + len(output))
-
-    return header_row + len(output) + 2  # +2 for spacing
-
-
-def _write_df_to_ws(ws, df: pd.DataFrame, start_row: int) -> None:
-    """Write DataFrame values to worksheet starting at start_row (header)."""
-    # Header
-    for c_idx, col_name in enumerate(df.columns, start=1):
-        cell = ws.cell(start_row, c_idx, str(col_name))
-        cell.border = BORDER
-    # Data
-    for r_idx, (_, row) in enumerate(df.iterrows()):
-        for c_idx, col_name in enumerate(df.columns, start=1):
-            val = row[col_name]
-            val = as_python_scalar(val)
-            ws.cell(start_row + 1 + r_idx, c_idx, val).border = BORDER
-
-
-def _apply_section_formats(ws, header_row: int, data_start: int, data_end: int) -> None:
-    """Apply number formatting to one section's data rows."""
-    if data_end < data_start:
-        return
-    percent_kw = ("rate", "share", "coverage", "precision", "recall", "f1",
-                  "percentage", "pct", "比例", "率", "占比")
-    count_kw = ("count", "rows", "support", "positive", "negative", "总数", "数量", "行数", "缺口数")
-    for cell in ws[header_row]:
+def style_header(ws, row: int) -> None:
+    for cell in ws[row]:
         if cell.value is None:
             continue
-        header = str(cell.value).casefold()
-        for r in range(data_start, data_end + 1):
-            if any(k in header for k in percent_kw):
-                ws.cell(r, cell.column).number_format = "0.00%"
-            elif any(k in header for k in count_kw):
-                ws.cell(r, cell.column).number_format = "#,##0"
-
-
-def _finalize_sheet(ws, *, title_present: bool = True, is_summary: bool = False) -> None:
-    """Apply font and widths to a multi-section sheet."""
-    set_base_font(ws)
-    set_reasonable_widths(ws)
-
-    if is_summary:
-        # Special handling for summary sheet: format the value column by value_type
-        for row in range(3, ws.max_row + 1):
-            value_cell = ws.cell(row, 3)
-            type_cell = ws.cell(row, 4)
-            if type_cell.value == "percentage":
-                value_cell.number_format = "0.00%"
-            elif type_cell.value == "count":
-                value_cell.number_format = "#,##0"
-            elif type_cell.value == "decimal":
-                value_cell.number_format = "0.000"
-
-
-def write_dataframe(
-    writer: pd.ExcelWriter, sheet_name: str, df: pd.DataFrame, *,
-    index: bool = False, title: str | None = None,
-    freeze_panes: str = "A2", max_rows: int = EXCEL_MAX_DATA_ROWS,
-) -> tuple[str, bool]:
-    sheet_name = sanitize_sheet_name(sheet_name)
-    output = df.copy()
-    truncated = False
-    if max_rows >= 0 and len(output) > max_rows:
-        output = output.head(max_rows).copy()
-        truncated = True
-
-    startrow = 2 if title else 0
-    if output.empty and len(output.columns) == 0:
-        output = pd.DataFrame({"message": ["No data"]})
-
-    output.to_excel(writer, sheet_name=sheet_name, index=index, startrow=startrow)
-    ws = writer.book[sheet_name]
-
-    if title:
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(1, ws.max_column))
-        cell = ws.cell(1, 1, title)
-        cell.font = Font(name="微软雅黑", size=14, bold=True, color=WHITE)
-        cell.fill = PatternFill("solid", fgColor=NAVY)
-        cell.alignment = Alignment(horizontal="left", vertical="center")
-        ws.row_dimensions[1].height = 26
-        header_row = 3
-    else:
-        header_row = 1
-
-    style_header_row(ws, header_row)
-    ws.freeze_panes = freeze_panes if not title else "A4"
-
-    # Only apply base font and width to small sheets (skip detail sheets for performance)
-    if len(output) <= 5000:
-        set_base_font(ws)
-    else:
-        set_header_font_only(ws, header_row)
-    set_reasonable_widths(ws)
-
-    if truncated:
-        note_col = ws.max_column + 2
-        ws.cell(1, note_col,
-                f"注意：原始 {len(df):,} 行，因 Excel/配置限制仅输出前 {len(output):,} 行。")
-        ws.cell(1, note_col).font = Font(name="微软雅黑", color=RED, bold=True)
-    return sheet_name, truncated
-
-
-def style_header_row(ws, row: int) -> None:
-    for cell in ws[row]:
-        if cell.value is not None:
-            cell.fill = PatternFill("solid", fgColor=BLUE)
-            cell.font = Font(name="微软雅黑", color=WHITE, bold=True, size=10)
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = BORDER
+        cell.fill = PatternFill("solid", fgColor=BLUE)
+        cell.font = Font(name="微软雅黑", size=10, bold=True, color=WHITE)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = BORDER
     ws.row_dimensions[row].height = 30
 
 
-def set_base_font(ws) -> None:
-    """Set 微软雅黑 on all cells. Only called for small sheets."""
-    for row in ws.iter_rows():
+def style_section_title(ws, row: int, title: str, end_col: int) -> None:
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=max(1, end_col))
+    cell = ws.cell(row, 1, title)
+    cell.fill = PatternFill("solid", fgColor=NAVY)
+    cell.font = Font(name="微软雅黑", size=12, bold=True, color=WHITE)
+    cell.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[row].height = 24
+
+
+def set_base_font(ws, start_row: int = 1, max_rows: int | None = None) -> None:
+    end_row = ws.max_row if max_rows is None else min(ws.max_row, max_rows)
+    for row in ws.iter_rows(min_row=start_row, max_row=end_row):
         for cell in row:
             if cell.row == 1 and cell.fill.fill_type == "solid":
                 continue
-            current_color = cell.font.color
-            color = current_color if current_color and current_color.type else BLACK
-            cell.font = Font(name="微软雅黑", size=10, bold=cell.font.bold,
-                             italic=cell.font.italic, color=color)
-            cell.alignment = Alignment(
-                horizontal=cell.alignment.horizontal,
-                vertical=cell.alignment.vertical or "center",
-                wrap_text=cell.alignment.wrap_text,
-            )
+            if cell.value is not None:
+                cell.font = Font(
+                    name="微软雅黑",
+                    size=10,
+                    bold=cell.font.bold,
+                    italic=cell.font.italic,
+                    color=cell.font.color if cell.font.color else BLACK,
+                )
+                cell.alignment = Alignment(
+                    horizontal=cell.alignment.horizontal,
+                    vertical=cell.alignment.vertical or "center",
+                    wrap_text=cell.alignment.wrap_text,
+                )
 
 
-def set_header_font_only(ws, header_row: int) -> None:
-    """For large sheets: only set font on data rows without looping every cell."""
-    # Header is already styled. Data rows get a default font at row level.
-    default_font = Font(name="微软雅黑", size=10)
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        ws.row_dimensions[row_idx].font = default_font
-
-
-def set_reasonable_widths(ws, max_width: int = 45) -> None:
-    """Set column widths based on header + a sample of data rows."""
+def set_widths(ws, widths: Mapping[str, float] | None = None, max_width: int = 42) -> None:
+    widths = dict(widths or {})
     for col_idx in range(1, ws.max_column + 1):
-        max_len = 0
-        # Sample header + first 200 rows for speed
-        sample_rows = min(ws.max_row, 200)
-        for row_idx in range(1, sample_rows + 1):
-            val = ws.cell(row_idx, col_idx).value
-            if val is not None:
-                max_len = max(max_len, len(str(val)))
-        header = str(ws.cell(1, col_idx).value or ws.cell(3, col_idx).value or "").casefold()
-        if any(token in header for token in
-               ("text", "description", "reason", "top_", "note", "说明", "类别", "category", "status", "recommendation")):
-            width = min(max(max_len + 2, 18), max_width)
+        letter = get_column_letter(col_idx)
+        header_candidates = [ws.cell(r, col_idx).value for r in range(1, min(ws.max_row, 8) + 1)]
+        header = next((str(v) for v in header_candidates if v is not None), "")
+
+        if header in widths:
+            ws.column_dimensions[letter].width = widths[header]
+            continue
+
+        sample_max = len(header)
+        for row_idx in range(1, min(ws.max_row, 150) + 1):
+            value = ws.cell(row_idx, col_idx).value
+            if value is not None:
+                sample_max = max(sample_max, len(str(value)))
+
+        header_lower = header.casefold()
+        if any(k in header_lower for k in ["text", "reason", "说明", "去向", "category"]):
+            width = min(max(sample_max + 2, 18), max_width)
         else:
-            width = min(max(max_len + 2, 10), 24)
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
+            width = min(max(sample_max + 2, 10), 24)
+        ws.column_dimensions[letter].width = width
 
 
-def apply_confusion_heatmap(ws, title_rows: int = 1, percent: bool = False) -> None:
-    header_row = title_rows + 1
-    start_row = header_row + 1
-    if ws.max_row < start_row or ws.max_column < 2:
+def format_dataframe_region(ws, header_row: int, data_rows: int) -> None:
+    if data_rows <= 0:
         return
-    start = ws.cell(start_row, 2).coordinate
-    end = ws.cell(ws.max_row, ws.max_column).coordinate
-    ws.conditional_formatting.add(
-        f"{start}:{end}",
-        ColorScaleRule(
-            start_type="min", start_color=WHITE,
-            mid_type="percentile", mid_value=50, mid_color=LIGHT_YELLOW,
-            end_type="max", end_color=RED,
-        ),
-    )
-    number_format = "0.0%" if percent else "#,##0"
-    for row in ws.iter_rows(min_row=start_row, min_col=2):
-        for cell in row:
-            cell.number_format = number_format
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.freeze_panes = f"B{start_row}"
+
+    header_map = {
+        str(ws.cell(header_row, col).value): col
+        for col in range(1, ws.max_column + 1)
+        if ws.cell(header_row, col).value is not None
+    }
+    data_start = header_row + 1
+    data_end = header_row + data_rows
+
+    for header, col in header_map.items():
+        h = header.casefold()
+        for row in range(data_start, data_end + 1):
+            cell = ws.cell(row, col)
+            cell.border = BORDER
+            cell.alignment = Alignment(vertical="center", wrap_text=False)
+            if any(token in h for token in ["率", "比例", "share", "rate", "coverage"]):
+                cell.number_format = "0.00%"
+            elif any(token in h for token in ["数量", "总数", "分子", "分母", "排名", "count"]):
+                cell.number_format = "#,##0"
 
 
-def write_confusion_sheet(
-    writer: pd.ExcelWriter, sheet_name: str, matrix: pd.DataFrame,
-    title: str, percent: bool,
+def apply_rate_color_scale(ws, header_row: int, data_rows: int, headers: Sequence[str]) -> None:
+    if data_rows <= 0:
+        return
+    header_map = {
+        str(ws.cell(header_row, col).value): col
+        for col in range(1, ws.max_column + 1)
+        if ws.cell(header_row, col).value is not None
+    }
+    for header in headers:
+        col = header_map.get(header)
+        if not col:
+            continue
+        start = ws.cell(header_row + 1, col).coordinate
+        end = ws.cell(header_row + data_rows, col).coordinate
+        ws.conditional_formatting.add(
+            f"{start}:{end}",
+            ColorScaleRule(
+                start_type="min", start_color=LIGHT_RED,
+                mid_type="percentile", mid_value=50, mid_color=LIGHT_YELLOW,
+                end_type="max", end_color=LIGHT_GREEN,
+            ),
+        )
+
+
+def apply_count_data_bar(ws, header_row: int, data_rows: int, headers: Sequence[str]) -> None:
+    if data_rows <= 0:
+        return
+    header_map = {
+        str(ws.cell(header_row, col).value): col
+        for col in range(1, ws.max_column + 1)
+        if ws.cell(header_row, col).value is not None
+    }
+    for header in headers:
+        col = header_map.get(header)
+        if not col:
+            continue
+        start = ws.cell(header_row + 1, col).coordinate
+        end = ws.cell(header_row + data_rows, col).coordinate
+        ws.conditional_formatting.add(
+            f"{start}:{end}",
+            DataBarRule(start_type="min", end_type="max", color=BLUE, showValue=True),
+        )
+
+
+def write_heatmap_sheet(
+    writer: pd.ExcelWriter,
+    sheet_name: str,
+    matrix: pd.DataFrame,
+    title: str,
+    subtitle: str,
+    percent: bool,
 ) -> None:
     output = matrix.copy()
-    output.index.name = "reference_category \\ candidate_category"
-    output.to_excel(writer, sheet_name=sheet_name, startrow=1)
+    output.index.name = "参照方 Category \\ 候选方 Category"
+    output.to_excel(writer, sheet_name=sheet_name, startrow=2)
     ws = writer.book[sheet_name]
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(1, ws.max_column))
-    ws.cell(1, 1, title)
-    ws.cell(1, 1).fill = PatternFill("solid", fgColor=NAVY)
-    ws.cell(1, 1).font = Font(name="微软雅黑", color=WHITE, bold=True, size=14)
-    style_header_row(ws, 2)
-    set_base_font(ws)
-    set_reasonable_widths(ws, max_width=30)
-    apply_confusion_heatmap(ws, title_rows=1, percent=percent)
+
+    style_title(ws, title, subtitle)
+    style_header(ws, 3)
+
+    data_start = 4
+    if ws.max_row >= data_start and ws.max_column >= 2:
+        start = ws.cell(data_start, 2).coordinate
+        end = ws.cell(ws.max_row, ws.max_column).coordinate
+        ws.conditional_formatting.add(
+            f"{start}:{end}",
+            ColorScaleRule(
+                start_type="min", start_color=WHITE,
+                mid_type="percentile", mid_value=50, mid_color=LIGHT_YELLOW,
+                end_type="max", end_color=RED,
+            ),
+        )
+
+        number_format = "0.0%" if percent else "#,##0"
+        for row in ws.iter_rows(min_row=data_start, min_col=2):
+            for cell in row:
+                cell.number_format = number_format
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for row in ws.iter_rows(min_row=3):
+        for cell in row:
+            if cell.value is not None:
+                cell.border = BORDER
+
+    ws.freeze_panes = "B4"
+    ws.auto_filter.ref = f"A3:{get_column_letter(ws.max_column)}{ws.max_row}"
+    ws.column_dimensions["A"].width = 34
+    for col in range(2, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 16
+    set_base_font(ws, max_rows=ws.max_row)
 
 
 # =====================================================================
-# Dashboard
+# Report writer
 # =====================================================================
 
-def write_dashboard(
+def write_core_sheet(
     writer: pd.ExcelWriter,
-    category_summary: Mapping[str, Any],
-    cp_coverage: Mapping[str, Any],
-    per_category: pd.DataFrame,
-    confusion_pairs: pd.DataFrame,
+    summary_table: pd.DataFrame,
+    category_comparison: pd.DataFrame,
+    difference_flows: pd.DataFrame,
     config: ReportConfig,
 ) -> None:
-    wb = writer.book
-    ws = wb.create_sheet("00_dashboard", 0)
-    ws.freeze_panes = "A6"
+    sheet_name = "00_核心对比"
+    ws = writer.book.create_sheet(sheet_name, 0)
 
-    ws.merge_cells("A1:I2")
-    ws["A1"] = "Category Comparison Quality Dashboard"
-    ws["A1"].font = Font(name="微软雅黑", size=18, bold=True, color=WHITE)
-    ws["A1"].fill = PatternFill("solid", fgColor=NAVY)
-    ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
-
-    ws.merge_cells("A3:I3")
-    ws["A3"] = (
+    subtitle = (
         f"{config.reference_label} ({config.reference_category}) vs "
         f"{config.candidate_label} ({config.candidate_category}) | "
-        f"Generated: {datetime.now():%Y-%m-%d %H:%M:%S}"
+        f"生成时间: {datetime.now():%Y-%m-%d %H:%M:%S}"
     )
-    ws["A3"].font = Font(name="微软雅黑", color=DARK_BLUE, italic=True)
+    style_title(
+        ws,
+        "Category 核心差异对比",
+        subtitle,
+        end_col=max(6, len(category_comparison.columns), len(difference_flows.columns)),
+    )
 
-    def write_block(title: str, start_row: int, start_col: int, rows: list[list[Any]]) -> None:
-        title_cell = ws.cell(start_row, start_col, title)
-        title_cell.font = Font(name="微软雅黑", bold=True, size=12, color=NAVY)
-        header_row = start_row + 1
-        for r_offset, row in enumerate(rows):
-            for c_offset, value in enumerate(row):
-                cell = ws.cell(header_row + r_offset, start_col + c_offset, value)
+    # Section 1: 核心指标
+    row = 4
+    style_section_title(ws, row, "1. 核心指标", 6)
+    header_row = row + 1
+    summary_output = summary_table[["指标", "结果", "分子", "分母", "说明", "格式"]]
+    summary_output.to_excel(writer, sheet_name=sheet_name, index=False, startrow=header_row - 1)
+    style_header(ws, header_row)
+    format_dataframe_region(ws, header_row, len(summary_output))
+
+    # 按“格式”列控制结果列格式
+    for i, fmt in enumerate(summary_output["格式"], start=header_row + 1):
+        result_cell = ws.cell(i, 2)
+        if fmt == "percentage":
+            result_cell.number_format = "0.00%"
+        elif fmt == "count":
+            result_cell.number_format = "#,##0"
+    ws.column_dimensions["F"].hidden = True
+
+    # Section 2: 逐 Category 差异
+    row = header_row + len(summary_output) + 2
+    style_section_title(ws, row, "2. 逐 Category 差异（按差异数量排序）", len(category_comparison.columns))
+    cat_header = row + 1
+    category_comparison.to_excel(writer, sheet_name=sheet_name, index=False, startrow=cat_header - 1)
+    style_header(ws, cat_header)
+    format_dataframe_region(ws, cat_header, len(category_comparison))
+    apply_rate_color_scale(
+        ws,
+        cat_header,
+        len(category_comparison),
+        ["参照方Category一致率", "双方非空时一致率"],
+    )
+    apply_count_data_bar(
+        ws,
+        cat_header,
+        len(category_comparison),
+        ["流向其他Category", "候选方缺失"],
+    )
+
+    # Section 3: 主要差异流向
+    row = cat_header + len(category_comparison) + 2
+    top_flows = difference_flows.head(config.top_n).copy()
+    style_section_title(ws, row, f"3. Top {len(top_flows)} Category 差异流向", len(top_flows.columns))
+    flow_header = row + 1
+    top_flows.to_excel(writer, sheet_name=sheet_name, index=False, startrow=flow_header - 1)
+    style_header(ws, flow_header)
+    format_dataframe_region(ws, flow_header, len(top_flows))
+    apply_count_data_bar(ws, flow_header, len(top_flows), ["数量"])
+
+    ws.freeze_panes = "A6"
+    ws.sheet_properties.tabColor = NAVY
+    set_widths(ws, {
+        "指标": 30,
+        "说明": 44,
+        "Category": 28,
+        "主要差异去向": 44,
+        "参照方Category": 28,
+        "候选方Category": 28,
+        "差异类型": 20,
+    })
+    set_base_font(ws, max_rows=ws.max_row)
+
+
+def write_detail_sheet(
+    writer: pd.ExcelWriter,
+    details: pd.DataFrame,
+    config: ReportConfig,
+) -> bool:
+    sheet_name = "03_差异明细"
+    max_rows = min(config.max_detail_rows, EXCEL_MAX_DATA_ROWS)
+    output = details.head(max_rows).copy()
+    truncated = len(details) > len(output)
+
+    output.to_excel(writer, sheet_name=sheet_name, index=False, startrow=2)
+    ws = writer.book[sheet_name]
+    subtitle = (
+        f"仅包含分类不一致、仅参照方有值、仅候选方有值。"
+        f"共 {len(details):,} 行"
+        + (f"，当前仅输出前 {len(output):,} 行" if truncated else "")
+    )
+    style_title(ws, "Category 差异明细", subtitle)
+    style_header(ws, 3)
+
+    if len(output) > 0:
+        ws.auto_filter.ref = f"A3:{get_column_letter(ws.max_column)}{ws.max_row}"
+        for row in ws.iter_rows(min_row=4):
+            for cell in row:
                 cell.border = BORDER
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        style_header_row(ws, header_row)
+                cell.alignment = Alignment(vertical="center")
 
-    metric_rows = [
-        ["Metric", config.reference_label, config.candidate_label, "Difference / Result"],
-        ["Total rows", category_summary["total_rows"], "", ""],
-        ["Category coverage",
-         category_summary["reference_category_coverage"],
-         category_summary["candidate_category_coverage"],
-         category_summary["category_coverage_delta"]],
-        ["Counterparty coverage",
-         cp_coverage["reference_counterparty_coverage"],
-         cp_coverage["candidate_counterparty_coverage"],
-         cp_coverage["counterparty_coverage_delta"]],
-        ["Category agreement when both non-empty",
-         category_summary["joint_agreement_rate"], "", ""],
-        ["Coverage-adjusted category agreement",
-         category_summary["coverage_adjusted_agreement_rate"], "", ""],
-        ["Unique categories",
-         category_summary["reference_unique_categories"],
-         category_summary["candidate_unique_categories"],
-         category_summary["candidate_unique_categories"] - category_summary["reference_unique_categories"]],
-        ["One-sided category gaps",
-         category_summary["reference_only_count"],
-         category_summary["candidate_only_count"],
-         category_summary["candidate_only_count"] - category_summary["reference_only_count"]],
-        ["Macro F1 / Kappa / MCC",
-         category_summary["macro_f1_vs_reference"],
-         category_summary["cohen_kappa"],
-         category_summary["multiclass_mcc"]],
-    ]
-    write_block("Core metrics", 5, 1, metric_rows)
-    for row in (8, 9, 10, 11, 14):
-        for col in range(2, 5):
-            ws.cell(row, col).number_format = "0.00%" if row != 14 or col == 2 else "0.000"
-    for row in (7, 12, 13):
-        for col in range(2, 5):
-            ws.cell(row, col).number_format = "#,##0"
+        header_map = {
+            str(ws.cell(3, col).value): col
+            for col in range(1, ws.max_column + 1)
+            if ws.cell(3, col).value is not None
+        }
+        status_col = header_map.get("Category比对状态")
+        if status_col:
+            for row in range(4, ws.max_row + 1):
+                value = ws.cell(row, status_col).value
+                fill = LIGHT_RED if value == "分类不一致" else LIGHT_ORANGE
+                ws.cell(row, status_col).fill = PatternFill("solid", fgColor=fill)
 
-    filtered = per_category.loc[
-        per_category["reference_support"] >= config.min_category_support_for_rate_chart
-    ].copy()
-    if filtered.empty:
-        filtered = per_category.copy()
-    top_cat = filtered.sort_values(
-        ["mismatch_count", "broad_gap_rate_vs_reference"], ascending=[False, False]
-    ).head(config.top_n)
-    top_cat_rows = [["Category", "Reference support", "Mismatch count", "Broad gap rate"]]
-    for row in top_cat.itertuples(index=False):
-        top_cat_rows.append([row.category, row.reference_support, row.mismatch_count, row.broad_gap_rate_vs_reference])
-    write_block(f"Top {len(top_cat)} categories by mismatch", 5, 6, top_cat_rows)
-    for row in range(7, 7 + len(top_cat)):
-        ws.cell(row, 7).number_format = "#,##0"
-        ws.cell(row, 8).number_format = "#,##0"
-        ws.cell(row, 9).number_format = "0.00%"
+    ws.freeze_panes = "A4"
+    ws.sheet_properties.tabColor = GRAY
+    set_widths(ws, {
+        "Category比对状态": 20,
+        config.reference_category: 24,
+        config.candidate_category: 24,
+        "参照方Category_标准化": 26,
+        "候选方Category_标准化": 26,
+        "text": 48,
+        "classification_reason": 50,
+        "third_party": 30,
+        "counterparty": 30,
+    }, max_width=50)
 
-    pair_start = max(18, 8 + len(top_cat))
-    top_pairs = confusion_pairs.head(min(config.top_n, 15))
-    pair_rows = [["Reference category", "Candidate category", "Count", "Share of mismatches"]]
-    for row in top_pairs.itertuples(index=False):
-        pair_rows.append([row.reference_category, row.candidate_category, row.count, row.share_of_all_mismatches])
-    write_block("Top category disagreement flows", pair_start, 1, pair_rows)
-    for row in range(pair_start + 2, pair_start + 2 + len(top_pairs)):
-        ws.cell(row, 3).number_format = "#,##0"
-        ws.cell(row, 4).number_format = "0.00%"
+    # 大明细只处理标题和表头字体，避免逐单元格字体处理拖慢速度
+    set_base_font(ws, max_rows=min(ws.max_row, 500))
+    return truncated
 
-    for col in range(1, 10):
-        ws.column_dimensions[get_column_letter(col)].width = 18
-    ws.column_dimensions["A"].width = 34
-    ws.column_dimensions["F"].width = 28
-    set_base_font(ws)
-
-
-# =====================================================================
-# Main report writer
-# =====================================================================
 
 def write_report(
-    df: pd.DataFrame, config: ReportConfig,
-    prep_meta: Mapping[str, Any],
-    category_metrics: Mapping[str, Any],
-    cp_coverage: Mapping[str, Any],
+    config: ReportConfig,
+    summary_table: pd.DataFrame,
+    category_comparison: pd.DataFrame,
+    difference_flows: pd.DataFrame,
+    count_matrix: pd.DataFrame,
+    row_pct_matrix: pd.DataFrame,
     details: pd.DataFrame,
-) -> None:
+) -> bool:
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    category_summary = category_metrics["summary"]
-    summary_table = build_summary_table(category_summary, cp_coverage, config)
-    cp_summary_df = pd.DataFrame(
-        [{"metric": key, "value": value} for key, value in cp_coverage.items()]
-    )
-    max_detail = min(config.max_detail_rows, EXCEL_MAX_DATA_ROWS)
-
     with pd.ExcelWriter(config.output_path, engine="openpyxl") as writer:
-        # ---- 01 指标汇总 --------------------------------------------------
-        ws_name = sanitize_sheet_name("01_指标汇总")
-        ws = writer.book.create_sheet(ws_name, 0)
-        next_row = write_section(ws, summary_table, "核心指标", 1)
-        next_row = write_section(ws, category_metrics["status_distribution"], "Category 状态分布", next_row)
-        write_section(ws, cp_summary_df, "Counterparty 覆盖率", next_row)
-        _finalize_sheet(ws, title_present=True, is_summary=True)
-
-        # ---- 02 Category 表现 ---------------------------------------------
-        ws_name = sanitize_sheet_name("02_Category表现")
-        ws = writer.book.create_sheet(ws_name)
-        next_row = write_section(
-            ws, category_metrics["per_category"],
-            f"逐类别表现（以 {config.reference_label} 为参照）", 1,
+        write_core_sheet(
+            writer,
+            summary_table,
+            category_comparison,
+            difference_flows,
+            config,
         )
-        next_row = write_section(ws, category_metrics["confusion_pairs"], "主要不一致流向", next_row)
-        write_section(ws, category_metrics["coverage_gaps"], "单边覆盖缺口分布", next_row)
-        _finalize_sheet(ws, title_present=True)
 
-        # ---- 03-05 混淆矩阵 -----------------------------------------------
-        write_confusion_sheet(writer, "03_混淆矩阵_数量", category_metrics["confusion_count"],
-                              "Category confusion matrix - count", percent=False)
-        write_confusion_sheet(writer, "04_混淆矩阵_行占比", category_metrics["confusion_row_pct"],
-                              f"Confusion matrix - row %（{config.reference_label} → {config.candidate_label}）", percent=True)
-        write_confusion_sheet(writer, "05_混淆矩阵_列占比", category_metrics["confusion_col_pct"],
-                              f"Confusion matrix - column %（{config.candidate_label} ← {config.reference_label}）", percent=True)
+        write_heatmap_sheet(
+            writer,
+            "01_热力图_数量",
+            count_matrix,
+            "Category 对比热力图 - 数量",
+            "行 = 参照方 Category，列 = 候选方 Category；对角线为一致，非对角线为差异，(空) 为单边缺失。",
+            percent=False,
+        )
+        writer.book["01_热力图_数量"].sheet_properties.tabColor = RED
 
-        # ---- 06 全量比对 --------------------------------------------------
-        write_dataframe(writer, "06_全量比对", details, title="全量逐交易比对结果", max_rows=max_detail)
+        write_heatmap_sheet(
+            writer,
+            "02_热力图_行占比",
+            row_pct_matrix,
+            "Category 对比热力图 - 行占比",
+            "每一行合计为 100%，用于观察某个参照方 Category 在候选方中的具体流向。",
+            percent=True,
+        )
+        writer.book["02_热力图_行占比"].sheet_properties.tabColor = ORANGE
 
-        # ---- Dashboard (last, placed at position 0) -----------------------
-        write_dashboard(writer, category_summary, cp_coverage,
-                        category_metrics["per_category"], category_metrics["confusion_pairs"], config)
+        truncated = write_detail_sheet(writer, details, config)
 
-        # Tab colors
-        tab_colors = {
-            "00_dashboard": NAVY, "01_指标汇总": BLUE,
-            "02_Category表现": GREEN, "03_混淆矩阵_数量": RED,
-            "04_混淆矩阵_行占比": ORANGE, "05_混淆矩阵_列占比": ORANGE,
-            "06_全量比对": GRAY,
-        }
-        for name, color in tab_colors.items():
-            if name in writer.book.sheetnames:
-                writer.book[name].sheet_properties.tabColor = color
-
-        writer.book.properties.title = "Category Comparison Quality Report"
-        writer.book.properties.subject = "Two classification systems comparison"
-        writer.book.properties.creator = "category_quality_metrics.py"
+        writer.book.properties.title = "Simplified Category Difference Report"
+        writer.book.properties.subject = "Category comparison and difference analysis"
+        writer.book.properties.creator = "category_quality_metrics_simplified.py"
         writer.book.properties.description = (
             f"Comparison report: {config.reference_label} vs {config.candidate_label}"
         )
+
+    return truncated
 
 
 # =====================================================================
 # Console output
 # =====================================================================
 
-def print_summary(
-    category_summary: Mapping[str, Any],
-    cp_coverage: Mapping[str, Any],
-    config: ReportConfig,
-) -> None:
-    print("\n" + "=" * 76)
-    print("Category Comparison Quality Report")
-    print("=" * 76)
-    print(f"Rows: {category_summary['total_rows']:,}")
+def print_summary(summary: Mapping[str, Any], config: ReportConfig) -> None:
+    print("\n" + "=" * 72)
+    print("Simplified Category Difference Report")
+    print("=" * 72)
+    print(f"Rows: {summary['total_rows']:,}")
     print(
         f"Category coverage: {config.reference_label} "
-        f"{category_summary['reference_category_coverage']:.2%} | "
-        f"{config.candidate_label} {category_summary['candidate_category_coverage']:.2%}"
+        f"{summary['reference_coverage']:.2%} | "
+        f"{config.candidate_label} {summary['candidate_coverage']:.2%}"
     )
     print(
-        f"Category agreement when both non-empty: "
-        f"{category_summary['joint_agreement_rate']:.2%}"
+        "Agreement when both non-empty: "
+        f"{summary['agreement_rate_when_both_nonempty']:.2%}"
     )
     print(
-        f"Coverage-adjusted category agreement: "
-        f"{category_summary['coverage_adjusted_agreement_rate']:.2%}"
+        "Mismatch when both non-empty: "
+        f"{summary['mismatch_count']:,} "
+        f"({summary['mismatch_rate_when_both_nonempty']:.2%})"
     )
     print(
-        f"Macro F1 vs reference: {category_summary['macro_f1_vs_reference']:.2%} | "
-        f"Kappa: {category_summary['cohen_kappa']:.3f} | "
-        f"MCC: {category_summary['multiclass_mcc']:.3f}"
+        f"One-sided gaps: only {config.reference_label} "
+        f"{summary['reference_only_count']:,} | only {config.candidate_label} "
+        f"{summary['candidate_only_count']:,}"
     )
-    print(
-        f"Counterparty coverage: {config.reference_label} "
-        f"{cp_coverage['reference_counterparty_coverage']:.2%} | "
-        f"{config.candidate_label} {cp_coverage['candidate_counterparty_coverage']:.2%}"
-    )
+    print(f"All differences: {summary['all_difference_count']:,}")
 
 
 # =====================================================================
@@ -1238,46 +1144,51 @@ def print_summary(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a comprehensive comparison report for two category systems."
+        description="Generate a simplified Category comparison report with core metrics and heatmaps."
     )
     parser.add_argument("--input", default=str(DEFAULT_INPUT), help="输入 Excel 路径")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="输出 Excel 路径")
-    parser.add_argument("--sheet", default="transactions", help="输入 sheet 名")
-    parser.add_argument("--reference-category", default="category")
-    parser.add_argument("--candidate-category", default="finv_category")
-    parser.add_argument("--reference-counterparty", default="third_party")
-    parser.add_argument("--candidate-counterparty", default="counterparty")
-    parser.add_argument("--reference-label", default="illion")
-    parser.add_argument("--candidate-label", default="finv")
+    parser.add_argument("--sheet", default="transactions", help="输入 Sheet 名")
+    parser.add_argument("--reference-category", default="category", help="参照方 Category 字段")
+    parser.add_argument("--candidate-category", default="finv_category", help="候选方 Category 字段")
+    parser.add_argument("--reference-label", default="illion", help="参照方显示名称")
+    parser.add_argument("--candidate-label", default="finv", help="候选方显示名称")
     parser.add_argument("--alias-json", default=None, help="可选 Category alias JSON")
-    parser.add_argument("--top-n", type=int, default=20, help="图表与排行 Top N")
-    parser.add_argument("--min-category-support-for-rate-chart", type=int, default=20,
-                        help="Category 图表最小 support")
-    parser.add_argument("--max-detail-rows", type=int, default=EXCEL_MAX_DATA_ROWS,
-                        help="全量明细最大输出行数")
-    parser.add_argument("--keep-reference-counterparty-equal-category", action="store_true",
-                        help="不把 reference counterparty == reference category 视为污染")
+    parser.add_argument("--top-n", type=int, default=20, help="核心页展示的差异流向 Top N")
+    parser.add_argument(
+        "--max-detail-rows",
+        type=int,
+        default=EXCEL_MAX_DATA_ROWS,
+        help="差异明细最大输出行数",
+    )
+    parser.add_argument(
+        "--detail-columns",
+        default=None,
+        help="差异明细字段，使用英文逗号分隔；不传则使用默认字段",
+    )
     return parser.parse_args(argv)
 
 
 def build_config(args: argparse.Namespace) -> ReportConfig:
+    if args.detail_columns:
+        detail_columns = tuple(
+            col.strip() for col in args.detail_columns.split(",") if col.strip()
+        )
+    else:
+        detail_columns = tuple(DEFAULT_DETAIL_COLUMNS)
+
     return ReportConfig(
         input_path=Path(args.input).expanduser().resolve(),
         output_path=Path(args.output).expanduser().resolve(),
         sheet_name=args.sheet,
         reference_category=args.reference_category,
         candidate_category=args.candidate_category,
-        reference_counterparty=args.reference_counterparty,
-        candidate_counterparty=args.candidate_counterparty,
         reference_label=args.reference_label,
         candidate_label=args.candidate_label,
         alias_json=Path(args.alias_json).expanduser().resolve() if args.alias_json else None,
         top_n=args.top_n,
-        min_category_support_for_rate_chart=args.min_category_support_for_rate_chart,
         max_detail_rows=args.max_detail_rows,
-        exclude_reference_counterparty_equal_category=(
-            not args.keep_reference_counterparty_equal_category
-        ),
+        detail_columns=detail_columns,
     )
 
 
@@ -1289,28 +1200,39 @@ def main(argv: Sequence[str] | None = None) -> None:
     raw_df = load_data(config)
     print(f"      Loaded {len(raw_df):,} rows, {len(raw_df.columns):,} columns")
 
-    print("[2/6] Cleaning and building comparison statuses...")
-    prepared_df, display_map, prep_meta = prepare_comparison_data(raw_df, config)
+    print("[2/6] Cleaning and comparing Category values...")
+    prepared_df, display_map = prepare_comparison_data(raw_df, config)
 
-    print("[3/6] Computing Category metrics...")
-    category_metrics = compute_category_metrics(prepared_df, display_map, config)
+    print("[3/6] Computing core metrics and Category-level differences...")
+    summary, summary_table = compute_summary(prepared_df, config)
+    category_comparison = compute_category_comparison(prepared_df, display_map)
+    difference_flows = compute_difference_flows(prepared_df)
 
-    print("[4/6] Computing Counterparty coverage metrics...")
-    cp_coverage = compute_counterparty_coverage(prepared_df, config)
+    print("[4/6] Building heatmaps...")
+    count_matrix, row_pct_matrix = compute_matrices(prepared_df)
 
-    print("[5/6] Building transaction-level details...")
-    details = build_detail_table(prepared_df, config)
+    print("[5/6] Building difference details...")
+    details = build_difference_details(prepared_df, config)
 
-    print("[6/6] Writing Excel report...")
-    write_report(
-        prepared_df, config, prep_meta,
-        category_metrics, cp_coverage,
+    print("[6/6] Writing simplified Excel report...")
+    truncated = write_report(
+        config,
+        summary_table,
+        category_comparison,
+        difference_flows,
+        count_matrix,
+        row_pct_matrix,
         details,
     )
 
-    print_summary(category_metrics["summary"], cp_coverage, config)
+    print_summary(summary, config)
+    if truncated:
+        print(
+            f"Warning: difference details were truncated to "
+            f"{min(config.max_detail_rows, EXCEL_MAX_DATA_ROWS):,} rows."
+        )
     print(f"\nReport written to: {config.output_path}")
-    print("=" * 76)
+    print("=" * 72)
 
 
 if __name__ == "__main__":
