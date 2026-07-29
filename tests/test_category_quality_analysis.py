@@ -6,8 +6,15 @@ from pathlib import Path
 import openpyxl
 import pandas as pd
 
-import category_quality_metrics as metrics
-from category_quality_metrics import compute_all_metrics
+import category_quality_metrics as m
+from category_quality_metrics import (
+    ReportConfig,
+    build_summary_table,
+    compute_category_metrics,
+    compute_counterparty_coverage,
+    prepare_comparison_data,
+    write_report,
+)
 
 
 def metric_fixture() -> pd.DataFrame:
@@ -35,110 +42,102 @@ def metric_fixture() -> pd.DataFrame:
     })
 
 
+def make_config(output_path: Path | None = None) -> ReportConfig:
+    return ReportConfig(
+        input_path=Path("dummy.xlsx"),
+        output_path=output_path or Path("test_output.xlsx"),
+    )
+
+
 class CategoryQualityMetricsTest(unittest.TestCase):
-    def test_mismatch_flow_uses_strict_mismatch_denominator(self) -> None:
-        results = compute_all_metrics(metric_fixture())
+    def test_category_status_counts(self) -> None:
+        df, _, _ = prepare_comparison_data(metric_fixture(), make_config())
+        counts = df["__category_status"].value_counts()
+        self.assertEqual(counts.get("exact_match", 0), 1)
+        self.assertEqual(counts.get("mismatch", 0), 3)
+        self.assertEqual(counts.get("reference_only", 0), 2)
+        self.assertEqual(counts.get("candidate_only", 0), 1)
+        self.assertEqual(counts.get("both_empty", 0), 0)
 
-        external = next(
-            row for row in results["category_ranking"]
-            if row["illion_category"] == "External Transfers"
-        )
+    def test_per_category_mismatch_counts(self) -> None:
+        df, display_map, _ = prepare_comparison_data(metric_fixture(), make_config())
+        metrics = compute_category_metrics(df, display_map, make_config())
+        per_cat = metrics["per_category"]
+        external = per_cat.loc[per_cat["category"] == "External Transfers"].iloc[0]
+        self.assertEqual(external["reference_support"], 4)
+        self.assertEqual(external["true_positive"], 1)
+        self.assertEqual(external["mismatch_count"], 2)
+        self.assertEqual(external["candidate_missing_count"], 1)
 
-        self.assertEqual(
-            external["finv不一致Top3类别"],
-            "Internal Transfer (1, 50.0%), Credit Card Repayments (1, 50.0%)",
-        )
+    def test_confusion_matrix_row_pct(self) -> None:
+        df, display_map, _ = prepare_comparison_data(metric_fixture(), make_config())
+        metrics = compute_category_metrics(df, display_map, make_config())
+        row_pct = metrics["confusion_row_pct"]
+        self.assertAlmostEqual(row_pct.loc["External Transfers", "External Transfers"], 1 / 3)
+        self.assertAlmostEqual(row_pct.loc["External Transfers", "Internal Transfer"], 1 / 3)
+        self.assertAlmostEqual(row_pct.loc["External Transfers", "Credit Card Repayments"], 1 / 3)
 
-    def test_one_sided_category_distributions_have_expected_counts(self) -> None:
-        results = compute_all_metrics(metric_fixture())
+    def test_counterparty_coverage_only(self) -> None:
+        df = pd.DataFrame({
+            "category": ["A", "B"],
+            "finv_category": ["A", "B"],
+            "third_party": ["TP1", pd.NA],
+            "counterparty": ["CP1", "CP2"],
+        })
+        config = make_config()
+        prepared, _, _ = prepare_comparison_data(df, config)
+        cp = compute_counterparty_coverage(prepared, config)
+        self.assertEqual(cp["reference_counterparty_count"], 1)
+        self.assertEqual(cp["candidate_counterparty_count"], 2)
+        self.assertEqual(cp["reference_counterparty_coverage"], 0.5)
+        self.assertEqual(cp["candidate_counterparty_coverage"], 1.0)
 
-        self.assertEqual(results["il_has_fv_empty_count"], 2)
-        self.assertEqual(results["il_empty_fv_coverage_count"], 1)
-
-        illion_only = {
-            row["illion_category"]: row
-            for row in results["illion_only_categories"]
-        }
-        self.assertEqual(
-            illion_only["External Transfers"],
-            {
-                "illion_category": "External Transfers",
-                "缺口数": 1,
-                "占illion单边缺口": 50.0,
-                "illion有效总数": 4,
-                "finv缺失率": 25.0,
-            },
-        )
-
-        finv_only = {
-            row["finv_category"]: row
-            for row in results["finv_only_categories"]
-        }
-        self.assertEqual(finv_only["Retail"]["缺口数"], 1)
-        self.assertEqual(finv_only["Retail"]["illion为空"], 1)
-        self.assertNotIn("illion为All Other Credits", finv_only["Retail"])
-
-    def test_metrics_workbook_sections(self) -> None:
+    def test_excel_output_has_expected_sheets(self) -> None:
         output = Path(self._testMethodName + ".xlsx")
         self.addCleanup(output.unlink, missing_ok=True)
-        results = compute_all_metrics(metric_fixture())
-        metrics.write_metrics_xlsx(
-            results,
-            results["category_ranking"],
-            pd.DataFrame(),
-            output,
+
+        config = make_config(output)
+        raw_df = metric_fixture()
+        prepared_df, display_map, prep_meta = prepare_comparison_data(raw_df, config)
+        category_metrics = compute_category_metrics(prepared_df, display_map, config)
+        cp_coverage = compute_counterparty_coverage(prepared_df, config)
+        segment_analysis = pd.DataFrame()
+        data_quality = {
+            "checks": pd.DataFrame(),
+            "missing_patterns": pd.DataFrame(),
+            "category_variants": pd.DataFrame(),
+        }
+        details = pd.DataFrame()
+        disagreements = pd.DataFrame()
+        qa_sample = pd.DataFrame()
+
+        write_report(
+            prepared_df, config, prep_meta,
+            category_metrics, cp_coverage,
+            segment_analysis, data_quality,
+            details, disagreements, qa_sample,
         )
 
-        workbook = openpyxl.load_workbook(output, data_only=False)
-        self.assertTrue(
-            {
-                "illion_only_categories",
-                "finv_only_categories",
-                "category_flow_count",
-                "category_flow_row_pct",
-                "category_mismatch_share",
-            }
-            .issubset(workbook.sheetnames)
-        )
+        wb = openpyxl.load_workbook(output, data_only=False)
+        expected = {
+            "00_dashboard", "01_metric_dictionary", "02_summary",
+            "03_category_performance", "04_confusion_pairs",
+            "05_confusion_count", "06_confusion_row_pct", "07_confusion_col_pct",
+            "08_coverage_gaps", "09_counterparty_coverage",
+        }
+        self.assertTrue(expected.issubset(set(wb.sheetnames)))
 
-        count_sheet = workbook["category_flow_count"]
-        headers = [cell.value for cell in count_sheet[2]]
-        self.assertIn("合计", headers)
-        external_row = next(
-            row for row in range(3, count_sheet.max_row + 1)
-            if count_sheet.cell(row=row, column=1).value == "External Transfers"
-        )
-        illion_empty_row = next(
-            row for row in range(3, count_sheet.max_row + 1)
-            if count_sheet.cell(row=row, column=1).value == "(illion为空)"
-        )
-        internal_col = headers.index("Internal Transfer") + 1
-        retail_col = headers.index("Retail") + 1
-        total_col = headers.index("合计") + 1
-        self.assertEqual(count_sheet.cell(row=external_row, column=internal_col).value, 1)
-        self.assertEqual(count_sheet.cell(row=illion_empty_row, column=retail_col).value, 1)
-        self.assertEqual(count_sheet.cell(row=external_row, column=total_col).value, 4)
-        self.assertEqual(count_sheet.cell(row=count_sheet.max_row, column=1).value, "合计")
-        self.assertEqual(count_sheet.cell(row=count_sheet.max_row, column=total_col).value, 7)
-
-    def test_category_heatmap_tables_have_expected_percentages(self) -> None:
-        results = compute_all_metrics(metric_fixture())
-        heatmaps = results["category_heatmaps"]
-
-        row_pct = heatmaps["category_flow_row_pct"]
-        self.assertEqual(row_pct.loc["External Transfers", "External Transfers"], 25.0)
-        self.assertEqual(row_pct.loc["External Transfers", "(finv为空)"], 25.0)
-        self.assertEqual(row_pct.loc["External Transfers", "合计"], 100.0)
-        self.assertEqual(row_pct.loc["(illion为空)", "Retail"], 100.0)
-        self.assertEqual(row_pct.loc["合计", "Retail"], 28.6)
-        self.assertEqual(row_pct.loc["合计", "合计"], 100.0)
-
-        mismatch_share = heatmaps["category_mismatch_share"]
-        self.assertEqual(mismatch_share.loc["External Transfers", "Internal Transfer"], 33.3)
-        self.assertEqual(mismatch_share.loc["External Transfers", "(finv为空)"], 33.3)
-        self.assertEqual(mismatch_share.loc["External Transfers", "External Transfers"], 0.0)
-        self.assertEqual(mismatch_share.loc["(illion为空)", "Retail"], 100.0)
-        self.assertEqual(mismatch_share.loc["合计", "合计"], 100.0)
+    def test_summary_table_has_all_sections(self) -> None:
+        config = make_config()
+        raw_df = metric_fixture()
+        prepared_df, display_map, _ = prepare_comparison_data(raw_df, config)
+        category_metrics = compute_category_metrics(prepared_df, display_map, config)
+        cp_coverage = compute_counterparty_coverage(prepared_df, config)
+        summary = build_summary_table(category_metrics["summary"], cp_coverage, config)
+        sections = set(summary["section"])
+        self.assertIn("Category覆盖", sections)
+        self.assertIn("Category一致性", sections)
+        self.assertIn("Counterparty覆盖", sections)
 
 
 if __name__ == "__main__":
