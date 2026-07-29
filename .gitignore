@@ -19,5 +19,5 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Temp
-_verify_chinese.txt
+# Output reports
+*.xlsx
