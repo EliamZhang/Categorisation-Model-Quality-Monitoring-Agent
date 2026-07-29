@@ -1733,7 +1733,6 @@ def write_heatmap_sheet(
         mode="application",
     )
 
-    ws.freeze_panes = "A12"
     ws.sheet_properties.tabColor = RED
     ws.column_dimensions["A"].width = 34
     for col in range(2, max(2, ws.max_column) + 1):
@@ -2014,9 +2013,6 @@ def write_core_sheet(
         ],
     )
     apply_priority_fill(ws, cat_header, len(category_comparison))
-
-    # 表较宽：固定 Category / 关键标记 / 优先级三列，横向滚动时仍可识别行。
-    ws.freeze_panes = ws.cell(cat_header + 1, 4)
 
     # Section 3: 主要差异流向
     row = cat_header + len(category_comparison) + 2
