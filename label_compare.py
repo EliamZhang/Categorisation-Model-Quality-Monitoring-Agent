@@ -2124,8 +2124,6 @@ def write_detail_sheet(
     style_title(ws, "Category 人工排查明细", subtitle, end_col=max(5, len(output.columns)))
     style_detail_header(ws, 3, config)
 
-    ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "F4"
     ws.auto_filter.ref = f"A3:{get_column_letter(ws.max_column)}{max(3, ws.max_row)}"
 
     if len(output) > 0:
