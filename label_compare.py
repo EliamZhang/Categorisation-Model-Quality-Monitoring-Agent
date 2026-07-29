@@ -1493,47 +1493,6 @@ def apply_priority_fill(ws, header_row: int, data_rows: int) -> None:
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
-def write_kpi_cards(
-    ws,
-    start_row: int,
-    metrics: Sequence[tuple[str, Any, str, str]],
-    cards_per_row: int = 4,
-) -> int:
-    """写入紧凑 KPI 卡片，返回卡片区域最后一行。"""
-    card_width = 4
-    for idx, (label, value, number_format, note) in enumerate(metrics):
-        card_row = start_row + (idx // cards_per_row) * 3
-        card_col = 1 + (idx % cards_per_row) * card_width
-        end_col = card_col + card_width - 2
-
-        ws.merge_cells(start_row=card_row, start_column=card_col, end_row=card_row, end_column=end_col)
-        label_cell = ws.cell(card_row, card_col, label)
-        label_cell.fill = PatternFill("solid", fgColor=BLUE)
-        label_cell.font = Font(size=10, bold=True, color=WHITE)
-        label_cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        ws.merge_cells(start_row=card_row + 1, start_column=card_col, end_row=card_row + 1, end_column=end_col)
-        value_cell = ws.cell(card_row + 1, card_col, value if not pd.isna(value) else "-")
-        value_cell.fill = PatternFill("solid", fgColor=LIGHT_BLUE)
-        value_cell.font = Font(size=15, bold=True, color=NAVY)
-        value_cell.alignment = Alignment(horizontal="center", vertical="center")
-        if not pd.isna(value):
-            value_cell.number_format = number_format
-
-        ws.cell(card_row + 2, card_col, note)
-        ws.merge_cells(start_row=card_row + 2, start_column=card_col, end_row=card_row + 2, end_column=end_col)
-        note_cell = ws.cell(card_row + 2, card_col)
-        note_cell.font = Font(size=9, color=GRAY)
-        note_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-        for row in range(card_row, card_row + 3):
-            for col in range(card_col, end_col + 1):
-                ws.cell(row, col).border = BORDER
-
-    row_count = (len(metrics) + cards_per_row - 1) // cards_per_row
-    return start_row + row_count * 3 - 1
-
-
 def style_flow_table(ws, header_row: int, data_rows: int) -> None:
     if data_rows <= 0:
         return
@@ -1695,7 +1654,6 @@ def _apply_diagnostic_matrix_format(
 def write_heatmap_sheet(
     writer: pd.ExcelWriter,
     sheet_name: str,
-    summary: Mapping[str, Any],
     category_comparison: pd.DataFrame,
     difference_flows: pd.DataFrame,
     count_matrix: pd.DataFrame,
@@ -1722,23 +1680,7 @@ def write_heatmap_sheet(
     ws.sheet_view.showGridLines = False
     ws.sheet_view.zoomScale = 85
 
-    top5_contribution = (
-        float(difference_flows.head(5)["占全部差异比例"].sum())
-        if not difference_flows.empty else 0.0
-    )
-    metrics = [
-        ("Category差异总数", summary.get("all_difference_count", 0), "#,##0", "分类冲突 + 单边缺失"),
-        ("整体差异率", summary.get("all_difference_rate_vs_union", 0.0), "0.00%", "分母为两侧至少一侧有分类"),
-        ("影响申请数", summary.get("difference_application_count", pd.NA), "#,##0", "至少包含一笔差异交易的申请"),
-        ("差异交易金额", summary.get("difference_amount", pd.NA), "#,##0.00", "按交易金额绝对值汇总"),
-        ("Top 5流向贡献", top5_contribution, "0.00%", "前五个差异流向占全部差异"),
-        (f"{c}漏识别", summary.get("reference_only_count", 0), "#,##0", f"仅{r}有Category"),
-        (f"{c}新增识别", summary.get("candidate_only_count", 0), "#,##0", f"仅{c}有Category"),
-        ("影响用户数", summary.get("difference_user_count", pd.NA), "#,##0", "至少包含一笔差异交易的用户"),
-    ]
-    kpi_end = write_kpi_cards(ws, 4, metrics, cards_per_row=4)
-
-    row = kpi_end + 2
+    row = 4
     top_flows = difference_flows.head(config.top_n).copy()
     style_section_title(
         ws,
@@ -2166,7 +2108,6 @@ def write_detail_sheet(
 
 def write_report(
     config: ReportConfig,
-    summary: Mapping[str, Any],
     summary_table: pd.DataFrame,
     category_comparison: pd.DataFrame,
     difference_flows: pd.DataFrame,
@@ -2190,7 +2131,6 @@ def write_report(
         write_heatmap_sheet(
             writer,
             diagnostic_sheet_name,
-            summary,
             category_comparison,
             difference_flows,
             count_matrix,
@@ -2358,7 +2298,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     print("[6/6] Writing simplified Excel report...")
     truncated = write_report(
         config,
-        summary,
         summary_table,
         category_comparison,
         difference_flows,
