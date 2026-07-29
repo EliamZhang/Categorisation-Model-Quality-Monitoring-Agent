@@ -178,6 +178,16 @@ BLACK = "000000"
 THIN = Side(style="thin", color="D9E1F2")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
+# Excel typography and view defaults. Change this single value to switch the
+# font used throughout all three output Sheets.
+EXCEL_FONT_NAME = "Aptos"
+BODY_FONT_SIZE = 10
+DEFAULT_ZOOM_SCALE = 90
+DEFAULT_ROW_HEIGHT = 18
+
+BODY_FONT = Font(name=EXCEL_FONT_NAME, size=BODY_FONT_SIZE, color=BLACK)
+BODY_ALIGNMENT = Alignment(vertical="center", wrap_text=False)
+
 
 # =====================================================================
 # Configuration
@@ -1291,6 +1301,14 @@ def build_difference_details(
 # Excel formatting helpers
 # =====================================================================
 
+def configure_sheet_view(ws, freeze_panes: str) -> None:
+    """统一三个 Sheet 的视图、缩放、默认行高和冻结窗格。"""
+    ws.sheet_view.showGridLines = False
+    ws.sheet_view.zoomScale = DEFAULT_ZOOM_SCALE
+    ws.sheet_format.defaultRowHeight = DEFAULT_ROW_HEIGHT
+    ws.freeze_panes = freeze_panes
+
+
 def style_title(
     ws,
     title: str,
@@ -1301,15 +1319,16 @@ def style_title(
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_col)
     cell = ws.cell(1, 1, title)
     cell.fill = PatternFill("solid", fgColor=NAVY)
-    cell.font = Font(size=16, bold=True, color=WHITE)
+    cell.font = Font(name=EXCEL_FONT_NAME, size=16, bold=True, color=WHITE)
     cell.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[1].height = 28
 
     if subtitle:
         ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=end_col)
         sub = ws.cell(2, 1, subtitle)
-        sub.font = Font(size=10, italic=True, color=NAVY)
-        sub.alignment = Alignment(horizontal="left", vertical="center")
+        sub.font = Font(name=EXCEL_FONT_NAME, size=10, italic=True, color=NAVY)
+        sub.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws.row_dimensions[2].height = 20
 
 
 def style_header(ws, row: int) -> None:
@@ -1317,7 +1336,7 @@ def style_header(ws, row: int) -> None:
         if cell.value is None:
             continue
         cell.fill = PatternFill("solid", fgColor=BLUE)
-        cell.font = Font(size=10, bold=True, color=WHITE)
+        cell.font = Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=WHITE)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = BORDER
     ws.row_dimensions[row].height = 30
@@ -1327,7 +1346,7 @@ def style_section_title(ws, row: int, title: str, end_col: int) -> None:
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=max(1, end_col))
     cell = ws.cell(row, 1, title)
     cell.fill = PatternFill("solid", fgColor=NAVY)
-    cell.font = Font(size=12, bold=True, color=WHITE)
+    cell.font = Font(name=EXCEL_FONT_NAME, size=12, bold=True, color=WHITE)
     cell.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[row].height = 24
 
@@ -1373,8 +1392,9 @@ def format_dataframe_region(ws, header_row: int, data_rows: int) -> None:
         h = header.casefold()
         for row in range(data_start, data_end + 1):
             cell = ws.cell(row, col)
+            cell.font = BODY_FONT
             cell.border = BORDER
-            cell.alignment = Alignment(vertical="center", wrap_text=False)
+            cell.alignment = BODY_ALIGNMENT
             if any(token in h for token in ["率", "比例", "占比", "share", "rate", "coverage"]):
                 cell.number_format = "0.00%"
             elif "金额" in header:
@@ -1482,14 +1502,14 @@ def apply_priority_fill(ws, header_row: int, data_rows: int) -> None:
                 "P3": LIGHT_GREEN,
             }
             cell.fill = PatternFill("solid", fgColor=fill_by_priority.get(cell.value, WHITE))
-            cell.font = Font(bold=True, color=RED if cell.value == "P1" else BLACK)
+            cell.font = Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=RED if cell.value == "P1" else BLACK)
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
         if key_col:
             cell = ws.cell(row, key_col)
             if cell.value == "是":
                 cell.fill = PatternFill("solid", fgColor=LIGHT_BLUE)
-                cell.font = Font(bold=True, color=NAVY)
+                cell.font = Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=NAVY)
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
@@ -1521,12 +1541,12 @@ def style_flow_table(ws, header_row: int, data_rows: int) -> None:
             cell = ws.cell(row, priority_col)
             fill = {"P1": LIGHT_RED, "P2": LIGHT_YELLOW, "P3": LIGHT_GREEN}.get(cell.value, WHITE)
             cell.fill = PatternFill("solid", fgColor=fill)
-            cell.font = Font(bold=True, color=RED if cell.value == "P1" else BLACK)
+            cell.font = Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=RED if cell.value == "P1" else BLACK)
             cell.alignment = Alignment(horizontal="center", vertical="center")
         if key_col and ws.cell(row, key_col).value == "是":
             cell = ws.cell(row, key_col)
             cell.fill = PatternFill("solid", fgColor=LIGHT_BLUE)
-            cell.font = Font(bold=True, color=NAVY)
+            cell.font = Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=NAVY)
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
@@ -1546,7 +1566,9 @@ def write_matrix_section(
     style_section_title(ws, section_row, title, end_col)
     if matrix.empty:
         ws.cell(section_row + 1, 1, "无可用数据")
-        ws.cell(section_row + 1, 1).font = Font(italic=True, color=GRAY)
+        ws.cell(section_row + 1, 1).font = Font(
+            name=EXCEL_FONT_NAME, size=BODY_FONT_SIZE, italic=True, color=GRAY
+        )
         return section_row + 1
 
     output = matrix.copy()
@@ -1600,16 +1622,20 @@ def _apply_diagnostic_matrix_format(
     for row_offset, row_category in enumerate(matrix.index):
         excel_row = data_start + row_offset
         row_label = ws.cell(excel_row, 1)
+        row_label.font = BODY_FONT
         row_label.border = BORDER
         row_label.alignment = Alignment(vertical="center", wrap_text=True)
         if row_category == EMPTY_LABEL:
             row_label.fill = PatternFill("solid", fgColor=LIGHT_ORANGE)
-            row_label.font = Font(bold=True, color=ORANGE)
+            row_label.font = Font(
+                name=EXCEL_FONT_NAME, size=10, bold=True, color=ORANGE
+            )
 
         for col_offset, col_category in enumerate(matrix.columns, start=2):
             cell = ws.cell(excel_row, col_offset)
             value = matrix.loc[row_category, col_category]
             numeric_value = 0.0 if pd.isna(value) else float(value)
+            cell.font = BODY_FONT
             cell.border = BORDER
             cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.number_format = number_format
@@ -1622,7 +1648,7 @@ def _apply_diagnostic_matrix_format(
             if row_category == col_category and row_category != EMPTY_LABEL:
                 if mode == "full_count":
                     cell.fill = PatternFill("solid", fgColor=LIGHT_GREEN)
-                    cell.font = Font(bold=True, color=GREEN)
+                    cell.font = Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=GREEN)
                 else:
                     cell.value = None
                     cell.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
@@ -1630,7 +1656,7 @@ def _apply_diagnostic_matrix_format(
 
             if row_category == EMPTY_LABEL or col_category == EMPTY_LABEL:
                 cell.fill = PatternFill("solid", fgColor=LIGHT_ORANGE)
-                cell.font = Font(bold=True, color=ORANGE)
+                cell.font = Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=ORANGE)
                 continue
 
             if numeric_value >= high_cutoff and high_cutoff > 0:
@@ -1643,7 +1669,7 @@ def _apply_diagnostic_matrix_format(
                 fill_color = LIGHT_ORANGE
                 font_color = BLACK
             cell.fill = PatternFill("solid", fgColor=fill_color)
-            cell.font = Font(bold=True, color=font_color)
+            cell.font = Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=font_color)
 
     for col in range(2, matrix.shape[1] + 2):
         header = ws.cell(header_row, col)
@@ -1677,8 +1703,7 @@ def write_heatmap_sheet(
         "差异流向占比仅使用非一致样本计算"
     )
     style_title(ws, "Category 差异诊断地图", subtitle, end_col=end_col)
-    ws.sheet_view.showGridLines = False
-    ws.sheet_view.zoomScale = 85
+    configure_sheet_view(ws, freeze_panes="A6")
 
     row = 4
     top_flows = difference_flows.head(config.top_n).copy()
@@ -1785,10 +1810,12 @@ def style_detail_header(ws, row: int, config: ReportConfig) -> None:
             fill_color = GRAY
 
         cell.fill = PatternFill("solid", fgColor=fill_color)
-        cell.font = Font(size=10, bold=True, color=WHITE)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.font = Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=WHITE)
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
         cell.border = BORDER
-    ws.row_dimensions[row].height = 28
+    ws.row_dimensions[row].height = 30
 
 
 def apply_detail_conditional_formatting(ws, header_row: int, data_rows: int) -> None:
@@ -1812,7 +1839,7 @@ def apply_detail_conditional_formatting(ws, header_row: int, data_rows: int) -> 
             FormulaRule(
                 formula=[f'{letter}{data_start}="P1"'],
                 fill=PatternFill("solid", fgColor=LIGHT_RED),
-                font=Font(bold=True, color=RED),
+                font=Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=RED),
             ),
         )
         ws.conditional_formatting.add(
@@ -1820,7 +1847,7 @@ def apply_detail_conditional_formatting(ws, header_row: int, data_rows: int) -> 
             FormulaRule(
                 formula=[f'{letter}{data_start}="P2"'],
                 fill=PatternFill("solid", fgColor=LIGHT_YELLOW),
-                font=Font(bold=True, color=BLACK),
+                font=Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=BLACK),
             ),
         )
         ws.conditional_formatting.add(
@@ -1828,7 +1855,7 @@ def apply_detail_conditional_formatting(ws, header_row: int, data_rows: int) -> 
             FormulaRule(
                 formula=[f'{letter}{data_start}="P3"'],
                 fill=PatternFill("solid", fgColor=LIGHT_GREEN),
-                font=Font(bold=True, color=BLACK),
+                font=Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=BLACK),
             ),
         )
 
@@ -1866,7 +1893,7 @@ def apply_detail_conditional_formatting(ws, header_row: int, data_rows: int) -> 
             FormulaRule(
                 formula=[f'{letter}{data_start}="是"'],
                 fill=PatternFill("solid", fgColor=LIGHT_BLUE),
-                font=Font(bold=True, color=NAVY),
+                font=Font(name=EXCEL_FONT_NAME, size=10, bold=True, color=NAVY),
             ),
         )
 
@@ -1880,7 +1907,7 @@ def apply_detail_conditional_formatting(ws, header_row: int, data_rows: int) -> 
 
 
 def format_detail_columns(ws, header_row: int, data_rows: int, config: ReportConfig) -> None:
-    """设置第三个 Sheet 的重点字段格式，避免对所有单元格进行重样式处理。"""
+    """统一第三个 Sheet 的正文字体、边框、对齐方式和数字格式。"""
     if data_rows <= 0:
         return
 
@@ -1892,14 +1919,34 @@ def format_detail_columns(ws, header_row: int, data_rows: int, config: ReportCon
     data_start = header_row + 1
     data_end = header_row + data_rows
 
-    center_headers = ["排查优先级", "排查类型", "差异流向数量", "是否关键Category", "dr_cr"]
+    # 与前两个 Sheet 保持一致：正文统一使用同一字体、浅色边框和垂直居中。
+    # 复用不可变样式对象，避免在大明细表中重复创建大量 Font/Border 对象。
+    for row_cells in ws.iter_rows(
+        min_row=data_start,
+        max_row=data_end,
+        min_col=1,
+        max_col=ws.max_column,
+    ):
+        for cell in row_cells:
+            cell.font = BODY_FONT
+            cell.border = BORDER
+            cell.alignment = BODY_ALIGNMENT
 
+    center_headers = [
+        "排查优先级",
+        "排查类型",
+        "差异流向数量",
+        "是否关键Category",
+        "dr_cr",
+    ]
     for header in center_headers:
         col = header_map.get(header)
         if not col:
             continue
         for row in range(data_start, data_end + 1):
-            ws.cell(row, col).alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(row, col).alignment = Alignment(
+                horizontal="center", vertical="center", wrap_text=False
+            )
 
     amount_col = header_map.get(config.amount_column)
     if amount_col:
@@ -1910,6 +1957,17 @@ def format_detail_columns(ws, header_row: int, data_rows: int, config: ReportCon
     if count_col:
         for row in range(data_start, data_end + 1):
             ws.cell(row, count_col).number_format = "#,##0"
+
+    date_formats = {
+        "transaction_date": "yyyy-mm-dd",
+        "sample_datetime": "yyyy-mm-dd hh:mm:ss",
+    }
+    for header, number_format in date_formats.items():
+        col = header_map.get(header)
+        if not col:
+            continue
+        for row in range(data_start, data_end + 1):
+            ws.cell(row, col).number_format = number_format
 
 
 def hide_detail_columns(ws, header_row: int, config: ReportConfig) -> None:
@@ -1955,6 +2013,7 @@ def write_core_sheet(
         subtitle,
         end_col=max(6, len(category_comparison.columns), len(difference_flows.columns)),
     )
+    configure_sheet_view(ws, freeze_panes="A6")
 
     # Section 1: 核心指标
     row = 4
@@ -2060,6 +2119,7 @@ def write_detail_sheet(
         + "。灰色技术字段和原始分类默认隐藏，可在 Excel 中取消隐藏。"
     )
     style_title(ws, "Category 人工排查明细", subtitle, end_col=max(5, len(output.columns)))
+    configure_sheet_view(ws, freeze_panes="A4")
     style_detail_header(ws, 3, config)
 
     ws.auto_filter.ref = f"A3:{get_column_letter(ws.max_column)}{max(3, ws.max_row)}"
@@ -2115,6 +2175,12 @@ def write_report(
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with pd.ExcelWriter(config.output_path, engine="openpyxl") as writer:
+        # Set the workbook Normal style first so any cells without an explicit
+        # style still use the same font as the styled report regions.
+        writer.book._named_styles["Normal"].font = Font(
+            name=EXCEL_FONT_NAME, size=BODY_FONT_SIZE, color=BLACK
+        )
+
         write_core_sheet(
             writer,
             summary_table,
