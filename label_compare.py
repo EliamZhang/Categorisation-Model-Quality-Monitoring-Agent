@@ -13,11 +13,17 @@ Simplified Category Difference Report
 - reference category: category（例如 illion）
 - candidate category: finv_category（例如 finv）
 
-输出 Excel 仅保留 4 个 Sheet：
-- 00_核心对比：关键指标、逐类别差异、主要差异流向
-- 01_热力图_数量：Category 对比数量矩阵
-- 02_热力图_行占比：以 reference Category 为基准的流向占比
+输出 Excel 保留 3 个 Sheet：
+- 00_核心对比：关键指标、逐 Category 优先级分析、主要差异流向
+- 01_热力图：Category 对比数量矩阵及 reference 行占比
 - 03_差异明细：仅输出不一致和单边缺失的交易
+
+其中“00_核心对比”的第二张表重点回答：
+- 哪些 reference Category 的差异数量最多？
+- 各 Category 对整体差异贡献多少？
+- 差异影响多少用户、申请和交易金额？
+- 主要流出/流入方向是什么？
+- 建议优先排查哪些 Category？
 
 说明：
 - reference 不一定是人工真值，因此本报告使用“一致率/差异率”，不使用 Accuracy、F1、Kappa 等容易被误解的指标。
@@ -28,6 +34,7 @@ Simplified Category Difference Report
     pandas
     numpy
     openpyxl
+    python-calamine（可选；未安装时 .xlsx/.xlsm 自动回退到 openpyxl）
 
 示例：
     python label_compare.py \
@@ -81,6 +88,39 @@ STATUS_CN_BASE = {
     "candidate_only": "仅{cand}有分类",
     "both_empty": "双方为空",
 }
+
+# 第二张表的可选业务影响字段。字段不存在时，对应指标留空，不阻断报告生成。
+DEFAULT_USER_ID_COLUMN = "user_id"
+DEFAULT_APPLICATION_ID_COLUMN = "application_id"
+DEFAULT_AMOUNT_COLUMN = "amount"
+
+# 关键业务 Category 使用关键词匹配（标准化后进行包含判断）。
+# 可通过 --key-category-keywords 覆盖。
+DEFAULT_KEY_CATEGORY_KEYWORDS = (
+    "liability",
+    "loan",
+    "credit card",
+    "repayment",
+    "income",
+    "wage",
+    "salary",
+    "rent",
+    "gambling",
+    "utilities",
+    "financial institution",
+    "financial service",
+)
+
+# 建议优先级规则（保持简单、可解释）：
+# P1：差异数位于正差异 Category 的前 25%，且差异贡献率 >= 5% 或差异率 >= 30%；
+#     关键 Category 达到高差异数或高贡献率时也进入 P1。
+# P2：存在差异，且差异数达到中位数、贡献率 >= 2%、差异率 >= 15%，或属于关键 Category。
+# P3：其余情况；小样本且整体贡献有限的 Category 默认归入 P3。
+P1_CONTRIBUTION_THRESHOLD = 0.05
+P1_DIFFERENCE_RATE_THRESHOLD = 0.30
+P2_CONTRIBUTION_THRESHOLD = 0.02
+P2_DIFFERENCE_RATE_THRESHOLD = 0.15
+LOW_SUPPORT_THRESHOLD = 20
 
 # 默认差异明细字段：存在则保留，不存在则自动跳过
 DEFAULT_DETAIL_COLUMNS = [
@@ -140,6 +180,12 @@ class ReportConfig:
     reference_label: str = "illion"
     candidate_label: str = "finv"
 
+    # 第二张表的业务影响字段；不存在时自动跳过相关计算并在 Excel 中留空。
+    user_id_column: str = DEFAULT_USER_ID_COLUMN
+    application_id_column: str = DEFAULT_APPLICATION_ID_COLUMN
+    amount_column: str = DEFAULT_AMOUNT_COLUMN
+    key_category_keywords: tuple[str, ...] = DEFAULT_KEY_CATEGORY_KEYWORDS
+
     alias_json: Path | None = None
     top_n: int = 20
     max_detail_rows: int = EXCEL_MAX_DATA_ROWS
@@ -158,6 +204,47 @@ def safe_div(numerator: float | int, denominator: float | int, default: float = 
     if denominator is None or denominator == 0 or pd.isna(denominator):
         return default
     return float(numerator) / float(denominator)
+
+
+def coerce_abs_amount(series: pd.Series) -> pd.Series:
+    """将金额字段转为绝对值数值。
+
+    支持常见的逗号、货币符号和括号负数，例如：
+    1,234.56、$1,234.56、(123.45)。无法解析的值转为 NaN。
+    """
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce").abs()
+
+    text = series.astype("string").str.strip()
+    text = text.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+    text = text.str.replace(r"[^0-9eE+\-.]", "", regex=True)
+    return pd.to_numeric(text, errors="coerce").abs()
+
+
+def count_unique_nonempty(series: pd.Series) -> int:
+    """统计清洗后非空的唯一值数量。"""
+    return int(clean_series(series).nunique(dropna=True))
+
+
+def top_category_text(values: pd.Series, top_n: int = 3) -> str:
+    """将主要流向/来源格式化为 'Category: n; Category: n'。"""
+    counts = values.dropna().astype(str).value_counts().head(top_n)
+    if counts.empty:
+        return "-"
+    return "; ".join(f"{category}: {int(count):,}" for category, count in counts.items())
+
+
+def is_key_category(category: str, keywords: Sequence[str]) -> bool:
+    """根据标准化关键词判断是否为业务关键 Category。"""
+    normalized_category = normalize_scalar(category)
+    if pd.isna(normalized_category):
+        return False
+    category_text = str(normalized_category)
+    for keyword in keywords:
+        normalized_keyword = normalize_scalar(keyword)
+        if not pd.isna(normalized_keyword) and str(normalized_keyword) in category_text:
+            return True
+    return False
 
 
 def clean_scalar(value: Any) -> str | pd.NA:
@@ -315,8 +402,26 @@ def validate_config(config: ReportConfig) -> None:
 
 def load_data(config: ReportConfig) -> pd.DataFrame:
     validate_config(config)
+
     try:
-        df = pd.read_excel(config.input_path, sheet_name=config.sheet_name, engine="calamine")
+        try:
+            # calamine 读取速度通常更快，适合大文件；未安装时自动回退。
+            df = pd.read_excel(
+                config.input_path,
+                sheet_name=config.sheet_name,
+                engine="calamine",
+            )
+        except ImportError:
+            if config.input_path.suffix.lower() == ".xls":
+                raise ImportError(
+                    "读取 .xls 文件需要安装 python-calamine。"
+                    "可执行: pip install python-calamine"
+                )
+            df = pd.read_excel(
+                config.input_path,
+                sheet_name=config.sheet_name,
+                engine="openpyxl",
+            )
     except ValueError as exc:
         xls = pd.ExcelFile(config.input_path)
         raise ValueError(
@@ -391,6 +496,14 @@ def prepare_comparison_data(
     # 热力图中用“(空)”显式表示单边缺失
     df["__ref_matrix"] = df["__ref_display"].fillna(EMPTY_LABEL)
     df["__cand_matrix"] = df["__cand_display"].fillna(EMPTY_LABEL)
+
+    # 第二张表的可选业务影响字段。不存在时不报错，后续指标写为空值。
+    if config.user_id_column in df.columns:
+        df["__user_id_clean"] = clean_series(df[config.user_id_column])
+    if config.application_id_column in df.columns:
+        df["__application_id_clean"] = clean_series(df[config.application_id_column])
+    if config.amount_column in df.columns:
+        df["__abs_amount"] = coerce_abs_amount(df[config.amount_column])
 
     return df, display_map
 
@@ -538,71 +651,209 @@ def compute_category_comparison(
     display_map: Mapping[str, str],
     config: ReportConfig,
 ) -> pd.DataFrame:
+    """生成第一个 Sheet 的第二张表：逐 Category 差异与优化优先级。
+
+    核心口径：
+    - reference侧差异数 = 流向其他 Category + candidate 缺失；
+    - 差异贡献率 = 该 Category reference侧差异数 / 全部 reference侧差异数；
+    - 差异用户/申请/金额均以 reference 为该 Category 且 candidate 不同或为空的交易为准；
+    - 双向变动数用于衡量单个 Category 的活跃变动程度，不应跨 Category 直接求和。
+    """
     ref_key = df["__ref_key"]
     cand_key = df["__cand_key"]
     r = config.reference_label
     c = config.candidate_label
+
+    ref_count_col = f"{r}数量"
+    cand_count_col = f"{c}数量"
+    ref_difference_count_col = f"{r}侧差异数"
+    ref_difference_rate_col = f"{r}侧差异率"
+    cand_missing_col = f"{c}缺失"
+    ref_missing_col = f"{r}缺失"
+    ref_amount_col = f"{r}金额"
+    cand_amount_col = f"{c}金额"
 
     keys = sorted(
         set(ref_key.dropna().astype(str)) | set(cand_key.dropna().astype(str)),
         key=lambda x: display_map.get(x, x).casefold(),
     )
 
+    has_user_id = "__user_id_clean" in df.columns
+    has_application_id = "__application_id_clean" in df.columns
+    has_amount = "__abs_amount" in df.columns
+
     rows: list[dict[str, Any]] = []
     for key in keys:
+        category_name = display_map.get(key, key)
         ref_mask = ref_key.eq(key)
         cand_mask = cand_key.eq(key)
         both_same = ref_mask & cand_mask
 
+        # reference 侧流出：candidate 分到其他 Category 或 candidate 为空。
         ref_to_other = ref_mask & cand_key.notna() & ~cand_mask
         ref_to_empty = ref_mask & cand_key.isna()
+        ref_difference = ref_to_other | ref_to_empty
+
+        # candidate 侧流入：来自其他 reference Category 或 reference 为空。
         other_to_candidate = cand_mask & ref_key.notna() & ~ref_mask
         empty_to_candidate = cand_mask & ref_key.isna()
+        candidate_difference = other_to_candidate | empty_to_candidate
 
         ref_support = int(ref_mask.sum())
         cand_support = int(cand_mask.sum())
         matched = int(both_same.sum())
         mismatch_out = int(ref_to_other.sum())
         candidate_missing = int(ref_to_empty.sum())
+        mismatch_in = int(other_to_candidate.sum())
+        reference_missing = int(empty_to_candidate.sum())
+        ref_difference_count = mismatch_out + candidate_missing
 
-        top_targets = (
-            df.loc[ref_to_other, "__cand_display"]
-            .value_counts(dropna=False)
-            .head(3)
-        )
-        top_target_text = "; ".join(
-            f"{target}: {int(count):,}" for target, count in top_targets.items()
-        ) or "-"
+        if has_user_id:
+            ref_user_count = int(df.loc[ref_mask, "__user_id_clean"].nunique(dropna=True))
+            difference_user_count: Any = int(
+                df.loc[ref_difference, "__user_id_clean"].nunique(dropna=True)
+            )
+            difference_user_rate: Any = safe_div(
+                difference_user_count, ref_user_count
+            )
+        else:
+            difference_user_count = pd.NA
+            difference_user_rate = pd.NA
+
+        if has_application_id:
+            ref_application_count = int(
+                df.loc[ref_mask, "__application_id_clean"].nunique(dropna=True)
+            )
+            difference_application_count: Any = int(
+                df.loc[ref_difference, "__application_id_clean"].nunique(dropna=True)
+            )
+            difference_application_rate: Any = safe_div(
+                difference_application_count, ref_application_count
+            )
+        else:
+            difference_application_count = pd.NA
+            difference_application_rate = pd.NA
+
+        if has_amount:
+            ref_amount: Any = float(
+                df.loc[ref_mask, "__abs_amount"].sum(min_count=1)
+            ) if df.loc[ref_mask, "__abs_amount"].notna().any() else pd.NA
+            cand_amount: Any = float(
+                df.loc[cand_mask, "__abs_amount"].sum(min_count=1)
+            ) if df.loc[cand_mask, "__abs_amount"].notna().any() else pd.NA
+            difference_amount: Any = float(
+                df.loc[ref_difference, "__abs_amount"].sum(min_count=1)
+            ) if df.loc[ref_difference, "__abs_amount"].notna().any() else 0.0
+            difference_amount_rate: Any = (
+                safe_div(difference_amount, ref_amount)
+                if not pd.isna(ref_amount)
+                else pd.NA
+            )
+        else:
+            ref_amount = pd.NA
+            cand_amount = pd.NA
+            difference_amount = pd.NA
+            difference_amount_rate = pd.NA
 
         rows.append({
-            "Category": display_map.get(key, key),
-            f"{r}数量": ref_support,
-            f"{c}数量": cand_support,
-            "数量差_候选减参照": cand_support - ref_support,
+            "Category": category_name,
+            "关键Category": "是" if is_key_category(category_name, config.key_category_keywords) else "否",
+            ref_count_col: ref_support,
+            cand_count_col: cand_support,
+            "数量净变化": cand_support - ref_support,
             "一致数量": matched,
+            ref_difference_count_col: ref_difference_count,
+            ref_difference_rate_col: safe_div(ref_difference_count, ref_support),
+            "差异贡献率": 0.0,  # 在全表排序后统一计算
+            "累计差异贡献率": 0.0,
+            "差异用户数": difference_user_count,
+            "差异用户占比": difference_user_rate,
+            "差异申请数": difference_application_count,
+            "差异申请占比": difference_application_rate,
+            ref_amount_col: ref_amount,
+            cand_amount_col: cand_amount,
+            "差异交易金额": difference_amount,
+            "差异金额占比": difference_amount_rate,
             "流向其他Category": mismatch_out,
-            "finv缺失": candidate_missing,
-            "来自其他Category": int(other_to_candidate.sum()),
-            "illion缺失": int(empty_to_candidate.sum()),
-            "illion Category一致率": safe_div(matched, ref_support),
-            "双方非空时一致率": safe_div(matched, matched + mismatch_out),
-            "差异及缺失率": safe_div(mismatch_out + candidate_missing, ref_support),
-            "主要差异去向": top_target_text,
+            cand_missing_col: candidate_missing,
+            "来自其他Category": mismatch_in,
+            ref_missing_col: reference_missing,
+            "双向变动数": ref_difference_count + int(candidate_difference.sum()),
+            "主要流出去向": top_category_text(df.loc[ref_to_other, "__cand_display"]),
+            "主要流入来源": top_category_text(df.loc[other_to_candidate, "__ref_display"]),
         })
 
+    columns = [
+        "Category", "关键Category", "建议优先级",
+        ref_count_col, cand_count_col, "数量净变化", "一致数量",
+        ref_difference_count_col, ref_difference_rate_col,
+        "差异贡献率", "累计差异贡献率",
+        "差异用户数", "差异用户占比",
+        "差异申请数", "差异申请占比",
+        ref_amount_col, cand_amount_col, "差异交易金额", "差异金额占比",
+        "流向其他Category", cand_missing_col,
+        "来自其他Category", ref_missing_col, "双向变动数",
+        "主要流出去向", "主要流入来源",
+    ]
+
     if not rows:
-        return pd.DataFrame(columns=[
-            "Category", "illion数量", "finv数量", "数量差_候选减参照",
-            "一致数量", "流向其他Category", "finv缺失", "来自其他Category",
-            "illion缺失", "illion Category一致率", "双方非空时一致率",
-            "差异及缺失率", "主要差异去向",
-        ])
+        return pd.DataFrame(columns=columns)
 
     result = pd.DataFrame(rows)
-    return result.sort_values(
-        ["流向其他Category", "finv缺失", "illion数量"],
-        ascending=[False, False, False],
+
+    # 真正按完整 reference 侧差异数排序；样本量作为次级排序。
+    result = result.sort_values(
+        [ref_difference_count_col, ref_count_col, "Category"],
+        ascending=[False, False, True],
+        kind="stable",
     ).reset_index(drop=True)
+
+    total_reference_difference = int(result[ref_difference_count_col].sum())
+    if total_reference_difference > 0:
+        result["差异贡献率"] = result[ref_difference_count_col] / total_reference_difference
+        result["累计差异贡献率"] = result["差异贡献率"].cumsum().clip(upper=1.0)
+
+    # 基于全表分布与固定业务阈值生成可解释优先级。
+    positive = result.loc[result[ref_difference_count_col] > 0]
+    if positive.empty:
+        high_count_cutoff = 0.0
+        medium_count_cutoff = 0.0
+    else:
+        high_count_cutoff = float(positive[ref_difference_count_col].quantile(0.75))
+        medium_count_cutoff = float(positive[ref_difference_count_col].median())
+
+    def determine_priority(row: pd.Series) -> str:
+        difference_count = int(row[ref_difference_count_col])
+        if difference_count <= 0:
+            return "P3"
+
+        difference_rate = float(row[ref_difference_rate_col])
+        contribution = float(row["差异贡献率"])
+        ref_support = int(row[ref_count_col])
+        key_category = row["关键Category"] == "是"
+
+        high_count = difference_count >= high_count_cutoff
+        medium_count = difference_count >= medium_count_cutoff
+        high_contribution = contribution >= P1_CONTRIBUTION_THRESHOLD
+        medium_contribution = contribution >= P2_CONTRIBUTION_THRESHOLD
+        high_rate = difference_rate >= P1_DIFFERENCE_RATE_THRESHOLD
+        medium_rate = difference_rate >= P2_DIFFERENCE_RATE_THRESHOLD
+
+        if (high_count and (high_contribution or high_rate)) or (
+            key_category and (high_count or high_contribution)
+        ):
+            return "P1"
+
+        # 小样本高差异率如果没有显著整体贡献，避免被误判为高优先级。
+        if ref_support < LOW_SUPPORT_THRESHOLD and not key_category and not medium_contribution:
+            return "P3"
+
+        if medium_count or medium_contribution or medium_rate or key_category:
+            return "P2"
+        return "P3"
+
+    result["建议优先级"] = result.apply(determine_priority, axis=1)
+    return result[columns]
 
 
 def compute_difference_flows(df: pd.DataFrame) -> pd.DataFrame:
@@ -794,9 +1045,16 @@ def format_dataframe_region(ws, header_row: int, data_rows: int) -> None:
             cell = ws.cell(row, col)
             cell.border = BORDER
             cell.alignment = Alignment(vertical="center", wrap_text=False)
-            if any(token in h for token in ["率", "比例", "share", "rate", "coverage"]):
+            if any(token in h for token in ["率", "比例", "占比", "share", "rate", "coverage"]):
                 cell.number_format = "0.00%"
-            elif any(token in h for token in ["数量", "总数", "分子", "分母", "排名", "count"]):
+            elif "金额" in header:
+                cell.number_format = "#,##0.00;[Red]-#,##0.00"
+            elif header == "数量净变化":
+                cell.number_format = "#,##0;[Red]-#,##0"
+            elif any(token in h for token in [
+                "数量", "总数", "差异数", "用户数", "申请数", "变动数",
+                "分子", "分母", "排名", "count",
+            ]):
                 cell.number_format = "#,##0"
 
 
@@ -842,6 +1100,67 @@ def apply_count_data_bar(ws, header_row: int, data_rows: int, headers: Sequence[
             f"{start}:{end}",
             DataBarRule(start_type="min", end_type="max", color=BLUE, showValue=True),
         )
+
+
+def apply_difference_rate_color_scale(
+    ws,
+    header_row: int,
+    data_rows: int,
+    headers: Sequence[str],
+) -> None:
+    """差异类指标：低值绿色，高值红色。"""
+    if data_rows <= 0:
+        return
+    header_map = {
+        str(ws.cell(header_row, col).value): col
+        for col in range(1, ws.max_column + 1)
+        if ws.cell(header_row, col).value is not None
+    }
+    for header in headers:
+        col = header_map.get(header)
+        if not col:
+            continue
+        start = ws.cell(header_row + 1, col).coordinate
+        end = ws.cell(header_row + data_rows, col).coordinate
+        ws.conditional_formatting.add(
+            f"{start}:{end}",
+            ColorScaleRule(
+                start_type="min", start_color=LIGHT_GREEN,
+                mid_type="percentile", mid_value=50, mid_color=LIGHT_YELLOW,
+                end_type="max", end_color=LIGHT_RED,
+            ),
+        )
+
+
+def apply_priority_fill(ws, header_row: int, data_rows: int) -> None:
+    if data_rows <= 0:
+        return
+    header_map = {
+        str(ws.cell(header_row, col).value): col
+        for col in range(1, ws.max_column + 1)
+        if ws.cell(header_row, col).value is not None
+    }
+    priority_col = header_map.get("建议优先级")
+    key_col = header_map.get("关键Category")
+
+    for row in range(header_row + 1, header_row + data_rows + 1):
+        if priority_col:
+            cell = ws.cell(row, priority_col)
+            fill_by_priority = {
+                "P1": LIGHT_RED,
+                "P2": LIGHT_YELLOW,
+                "P3": LIGHT_GREEN,
+            }
+            cell.fill = PatternFill("solid", fgColor=fill_by_priority.get(cell.value, WHITE))
+            cell.font = Font(bold=True, color=RED if cell.value == "P1" else BLACK)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        if key_col:
+            cell = ws.cell(row, key_col)
+            if cell.value == "是":
+                cell.fill = PatternFill("solid", fgColor=LIGHT_BLUE)
+                cell.font = Font(bold=True, color=NAVY)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
 def write_heatmap_sheet(
@@ -944,25 +1263,48 @@ def write_core_sheet(
             result_cell.number_format = "#,##0"
     ws.column_dimensions["F"].hidden = True
 
-    # Section 2: 逐 Category 差异
+    # Section 2: 逐 Category 差异与优化优先级
     row = header_row + len(summary_output) + 2
-    style_section_title(ws, row, "2. 逐 Category 差异（按差异数量排序）", len(category_comparison.columns))
+    ref_difference_count_col = f"{config.reference_label}侧差异数"
+    ref_difference_rate_col = f"{config.reference_label}侧差异率"
+    cand_missing_col = f"{config.candidate_label}缺失"
+    ref_amount_col = f"{config.reference_label}金额"
+    cand_amount_col = f"{config.candidate_label}金额"
+
+    style_section_title(
+        ws,
+        row,
+        f"2. 逐 Category 差异与优化优先级（按{ref_difference_count_col}降序）",
+        len(category_comparison.columns),
+    )
     cat_header = row + 1
     category_comparison.to_excel(writer, sheet_name=sheet_name, index=False, startrow=cat_header - 1)
     style_header(ws, cat_header)
     format_dataframe_region(ws, cat_header, len(category_comparison))
-    apply_rate_color_scale(
+    apply_difference_rate_color_scale(
         ws,
         cat_header,
         len(category_comparison),
-        ["illion Category一致率", "双方非空时一致率"],
+        [ref_difference_rate_col, "差异用户占比", "差异申请占比", "差异金额占比"],
     )
     apply_count_data_bar(
         ws,
         cat_header,
         len(category_comparison),
-        ["流向其他Category", "finv缺失"],
+        [
+            ref_difference_count_col,
+            "差异用户数",
+            "差异申请数",
+            "差异交易金额",
+            "流向其他Category",
+            cand_missing_col,
+            "双向变动数",
+        ],
     )
+    apply_priority_fill(ws, cat_header, len(category_comparison))
+
+    # 表较宽：固定 Category / 关键标记 / 优先级三列，横向滚动时仍可识别行。
+    ws.freeze_panes = ws.cell(cat_header + 1, 4)
 
     # Section 3: 主要差异流向
     row = cat_header + len(category_comparison) + 2
@@ -978,7 +1320,13 @@ def write_core_sheet(
         "指标": 30,
         "说明": 44,
         "Category": 28,
-        "主要差异去向": 44,
+        "关键Category": 14,
+        "建议优先级": 14,
+        "主要流出去向": 42,
+        "主要流入来源": 42,
+        ref_amount_col: 16,
+        cand_amount_col: 16,
+        "差异交易金额": 18,
         "illion Category": 28,
         "finv Category": 28,
         "差异类型": 20,
@@ -1120,8 +1468,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sheet", default="transactions", help="输入 Sheet 名")
     parser.add_argument("--reference-category", default="category", help="illion Category 字段")
     parser.add_argument("--candidate-category", default="finv_category", help="finv Category 字段")
-    parser.add_argument("--reference-label", default="illion", help="illion显示名称")
-    parser.add_argument("--candidate-label", default="finv", help="finv显示名称")
+    parser.add_argument("--reference-label", default="illion", help="reference侧显示名称")
+    parser.add_argument("--candidate-label", default="finv", help="candidate侧显示名称")
+    parser.add_argument("--user-id-column", default=DEFAULT_USER_ID_COLUMN, help="用户ID字段；不存在时用户指标留空")
+    parser.add_argument(
+        "--application-id-column",
+        default=DEFAULT_APPLICATION_ID_COLUMN,
+        help="申请ID字段；不存在时申请指标留空",
+    )
+    parser.add_argument("--amount-column", default=DEFAULT_AMOUNT_COLUMN, help="交易金额字段；按绝对值汇总")
+    parser.add_argument(
+        "--key-category-keywords",
+        default=",".join(DEFAULT_KEY_CATEGORY_KEYWORDS),
+        help="关键Category关键词，使用英文逗号分隔；标准化后按包含关系匹配",
+    )
     parser.add_argument("--alias-json", default=None, help="可选 Category alias JSON")
     parser.add_argument("--top-n", type=int, default=20, help="核心页展示的差异流向 Top N")
     parser.add_argument(
@@ -1146,6 +1506,12 @@ def build_config(args: argparse.Namespace) -> ReportConfig:
     else:
         detail_columns = tuple(DEFAULT_DETAIL_COLUMNS)
 
+    key_category_keywords = tuple(
+        keyword.strip()
+        for keyword in args.key_category_keywords.split(",")
+        if keyword.strip()
+    )
+
     return ReportConfig(
         input_path=Path(args.input).expanduser().resolve(),
         output_path=Path(args.output).expanduser().resolve(),
@@ -1154,6 +1520,10 @@ def build_config(args: argparse.Namespace) -> ReportConfig:
         candidate_category=args.candidate_category,
         reference_label=args.reference_label,
         candidate_label=args.candidate_label,
+        user_id_column=args.user_id_column,
+        application_id_column=args.application_id_column,
+        amount_column=args.amount_column,
+        key_category_keywords=key_category_keywords,
         alias_json=Path(args.alias_json).expanduser().resolve() if args.alias_json else None,
         top_n=args.top_n,
         max_detail_rows=args.max_detail_rows,
@@ -1168,6 +1538,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"[1/6] Loading: {config.input_path}")
     raw_df = load_data(config)
     print(f"      Loaded {len(raw_df):,} rows, {len(raw_df.columns):,} columns")
+
+    optional_columns = {
+        "差异用户指标": config.user_id_column,
+        "差异申请指标": config.application_id_column,
+        "金额影响指标": config.amount_column,
+    }
+    missing_optional = [
+        f"{metric}({column})"
+        for metric, column in optional_columns.items()
+        if column not in raw_df.columns
+    ]
+    if missing_optional:
+        print("      Optional metrics unavailable: " + ", ".join(missing_optional))
 
     print("[2/6] Cleaning and comparing Category values...")
     prepared_df, display_map = prepare_comparison_data(raw_df, config)
