@@ -99,7 +99,7 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         )
 
         wb = openpyxl.load_workbook(output, data_only=False)
-        expected = {"00_核心对比", "01_热力图_数量", "02_热力图_行占比", "03_差异明细"}
+        expected = {"00_核心对比", "01_热力图", "03_差异明细"}
         self.assertTrue(expected.issubset(set(wb.sheetnames)))
 
     def test_summary_has_expected_keys(self) -> None:

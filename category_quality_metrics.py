@@ -864,20 +864,46 @@ def apply_count_data_bar(ws, header_row: int, data_rows: int, headers: Sequence[
 def write_heatmap_sheet(
     writer: pd.ExcelWriter,
     sheet_name: str,
-    matrix: pd.DataFrame,
-    title: str,
-    subtitle: str,
-    percent: bool,
+    count_matrix: pd.DataFrame,
+    row_pct_matrix: pd.DataFrame,
 ) -> None:
-    output = matrix.copy()
-    output.index.name = "参照方 Category \\ 候选方 Category"
-    output.to_excel(writer, sheet_name=sheet_name, startrow=2)
-    ws = writer.book[sheet_name]
+    """Write a single sheet with two heatmaps: count (top) and row% (bottom)."""
+    ws = writer.book.create_sheet(sheet_name)
 
-    style_title(ws, title, subtitle)
+    # ── Count matrix ───────────────────────────────────────────────
+    count = count_matrix.copy()
+    count.index.name = "参照方 Category \\ 候选方 Category"
+    count.to_excel(writer, sheet_name=sheet_name, startrow=2)
+    style_title(ws, "Category 对比热力图", "上方: 数量 | 下方: 行占比")
     style_header(ws, 3)
 
-    data_start = 4
+    _apply_heatmap_format(ws, header_row=3, data_start=4, percent=False)
+    count_end = ws.max_row + 2  # 2 blank rows
+
+    # ── Row % matrix ───────────────────────────────────────────────
+    row_pct = row_pct_matrix.copy()
+    row_pct.index.name = "参照方 Category \\ 候选方 Category"
+    row_pct_start = count_end
+    style_section_title(ws, row_pct_start, "行占比（每个参照方 Category 的候选方流向，行合计 100%）", count_matrix.shape[1] + 1)
+    row_pct.to_excel(writer, sheet_name=sheet_name, startrow=row_pct_start + 1)
+    style_header(ws, row_pct_start + 2)
+
+    _apply_heatmap_format(ws, header_row=row_pct_start + 2, data_start=row_pct_start + 3, percent=True)
+
+    # ── Overall formatting ─────────────────────────────────────────
+    for row in ws.iter_rows(min_row=3):
+        for cell in row:
+            if cell.value is not None:
+                cell.border = BORDER
+
+    ws.freeze_panes = "B4"
+    ws.column_dimensions["A"].width = 34
+    for col in range(2, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 16
+    set_base_font(ws, max_rows=ws.max_row)
+
+
+def _apply_heatmap_format(ws, header_row: int, data_start: int, percent: bool) -> None:
     if ws.max_row >= data_start and ws.max_column >= 2:
         start = ws.cell(data_start, 2).coordinate
         end = ws.cell(ws.max_row, ws.max_column).coordinate
@@ -889,24 +915,11 @@ def write_heatmap_sheet(
                 end_type="max", end_color=RED,
             ),
         )
-
         number_format = "0.0%" if percent else "#,##0"
         for row in ws.iter_rows(min_row=data_start, min_col=2):
             for cell in row:
                 cell.number_format = number_format
                 cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    for row in ws.iter_rows(min_row=3):
-        for cell in row:
-            if cell.value is not None:
-                cell.border = BORDER
-
-    ws.freeze_panes = "B4"
-    ws.auto_filter.ref = f"A3:{get_column_letter(ws.max_column)}{ws.max_row}"
-    ws.column_dimensions["A"].width = 34
-    for col in range(2, ws.max_column + 1):
-        ws.column_dimensions[get_column_letter(col)].width = 16
-    set_base_font(ws, max_rows=ws.max_row)
 
 
 # =====================================================================
@@ -1077,23 +1090,11 @@ def write_report(
 
         write_heatmap_sheet(
             writer,
-            "01_热力图_数量",
+            "01_热力图",
             count_matrix,
-            "Category 对比热力图 - 数量",
-            "行 = 参照方 Category，列 = 候选方 Category；对角线为一致，非对角线为差异，(空) 为单边缺失。",
-            percent=False,
-        )
-        writer.book["01_热力图_数量"].sheet_properties.tabColor = RED
-
-        write_heatmap_sheet(
-            writer,
-            "02_热力图_行占比",
             row_pct_matrix,
-            "Category 对比热力图 - 行占比",
-            "每一行合计为 100%，用于观察某个参照方 Category 在候选方中的具体流向。",
-            percent=True,
         )
-        writer.book["02_热力图_行占比"].sheet_properties.tabColor = ORANGE
+        writer.book["01_热力图"].sheet_properties.tabColor = RED
 
         truncated = write_detail_sheet(writer, details, config)
 
