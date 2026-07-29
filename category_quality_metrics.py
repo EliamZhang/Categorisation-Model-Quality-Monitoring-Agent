@@ -73,12 +73,12 @@ STATUS_ORDER = [
     "both_empty",
 ]
 
-STATUS_CN = {
+STATUS_CN_BASE = {
     "exact_match": "原始值一致",
     "normalized_match": "标准化后一致",
     "mismatch": "分类不一致",
-    "reference_only": "仅参照方有分类",
-    "candidate_only": "仅候选方有分类",
+    "reference_only": "仅{ref}有分类",
+    "candidate_only": "仅{cand}有分类",
     "both_empty": "双方为空",
 }
 
@@ -385,7 +385,8 @@ def prepare_comparison_data(
     )
 
     df["__status"] = pd.Categorical(status, categories=STATUS_ORDER, ordered=True)
-    df["__status_cn"] = pd.Series(status, index=df.index).map(STATUS_CN)
+    cn_map = {k: v.format(ref=config.reference_label, cand=config.candidate_label) for k, v in STATUS_CN_BASE.items()}
+    df["__status_cn"] = pd.Series(status, index=df.index).map(cn_map)
 
     # 热力图中用“(空)”显式表示单边缺失
     df["__ref_matrix"] = df["__ref_display"].fillna(EMPTY_LABEL)
@@ -468,7 +469,7 @@ def compute_summary(df: pd.DataFrame, config: ReportConfig) -> tuple[dict[str, A
             "结果": summary["coverage_delta"],
             "分子": pd.NA,
             "分母": pd.NA,
-            "说明": "正值表示候选方覆盖率更高",
+            "说明": f"正值表示 {c} 覆盖率更高",
             "格式": "percentage",
         },
         {
@@ -500,7 +501,7 @@ def compute_summary(df: pd.DataFrame, config: ReportConfig) -> tuple[dict[str, A
             "结果": summary["all_difference_count"],
             "分子": summary["all_difference_count"],
             "分母": int(union.sum()),
-            "说明": "分类不一致 + 仅参照方有值 + 仅候选方有值",
+            "说明": f"分类不一致 + 仅 {r} 有值 + 仅 {c} 有值",
             "格式": "count",
         },
         {
@@ -535,9 +536,12 @@ def compute_summary(df: pd.DataFrame, config: ReportConfig) -> tuple[dict[str, A
 def compute_category_comparison(
     df: pd.DataFrame,
     display_map: Mapping[str, str],
+    config: ReportConfig,
 ) -> pd.DataFrame:
     ref_key = df["__ref_key"]
     cand_key = df["__cand_key"]
+    r = config.reference_label
+    c = config.candidate_label
 
     keys = sorted(
         set(ref_key.dropna().astype(str)) | set(cand_key.dropna().astype(str)),
@@ -572,15 +576,15 @@ def compute_category_comparison(
 
         rows.append({
             "Category": display_map.get(key, key),
-            "参照方数量": ref_support,
-            "候选方数量": cand_support,
+            f"{r}数量": ref_support,
+            f"{c}数量": cand_support,
             "数量差_候选减参照": cand_support - ref_support,
             "一致数量": matched,
             "流向其他Category": mismatch_out,
-            "候选方缺失": candidate_missing,
+            "finv缺失": candidate_missing,
             "来自其他Category": int(other_to_candidate.sum()),
-            "参照方缺失": int(empty_to_candidate.sum()),
-            "参照方Category一致率": safe_div(matched, ref_support),
+            "illion缺失": int(empty_to_candidate.sum()),
+            "illion Category一致率": safe_div(matched, ref_support),
             "双方非空时一致率": safe_div(matched, matched + mismatch_out),
             "差异及缺失率": safe_div(mismatch_out + candidate_missing, ref_support),
             "主要差异去向": top_target_text,
@@ -588,15 +592,15 @@ def compute_category_comparison(
 
     if not rows:
         return pd.DataFrame(columns=[
-            "Category", "参照方数量", "候选方数量", "数量差_候选减参照",
-            "一致数量", "流向其他Category", "候选方缺失", "来自其他Category",
-            "参照方缺失", "参照方Category一致率", "双方非空时一致率",
+            "Category", "illion数量", "finv数量", "数量差_候选减参照",
+            "一致数量", "流向其他Category", "finv缺失", "来自其他Category",
+            "illion缺失", "illion Category一致率", "双方非空时一致率",
             "差异及缺失率", "主要差异去向",
         ])
 
     result = pd.DataFrame(rows)
     return result.sort_values(
-        ["流向其他Category", "候选方缺失", "参照方数量"],
+        ["流向其他Category", "finv缺失", "illion数量"],
         ascending=[False, False, False],
     ).reset_index(drop=True)
 
@@ -607,8 +611,8 @@ def compute_difference_flows(df: pd.DataFrame) -> pd.DataFrame:
 
     if not difference.any():
         return pd.DataFrame(columns=[
-            "排名", "参照方Category", "候选方Category", "差异类型",
-            "数量", "占全部差异比例", "占参照方该Category比例",
+            "排名", "illion Category", "finv Category", "差异类型",
+            "数量", "占全部差异比例", "占illion该Category比例",
         ])
 
     subset = df.loc[difference, ["__ref_matrix", "__cand_matrix", "__status_cn"]].copy()
@@ -618,8 +622,8 @@ def compute_difference_flows(df: pd.DataFrame) -> pd.DataFrame:
         .rename("数量")
         .reset_index()
         .rename(columns={
-            "__ref_matrix": "参照方Category",
-            "__cand_matrix": "候选方Category",
+            "__ref_matrix": "illion Category",
+            "__cand_matrix": "finv Category",
             "__status_cn": "差异类型",
         })
     )
@@ -631,11 +635,11 @@ def compute_difference_flows(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     flows["占全部差异比例"] = flows["数量"] / total_difference
-    flows["占参照方该Category比例"] = flows.apply(
+    flows["占illion该Category比例"] = flows.apply(
         lambda row: safe_div(
             row["数量"],
-            ref_total.get(row["参照方Category"], 0),
-        ) if row["参照方Category"] != EMPTY_LABEL else pd.NA,
+            ref_total.get(row["illion Category"], 0),
+        ) if row["illion Category"] != EMPTY_LABEL else pd.NA,
         axis=1,
     )
 
@@ -659,7 +663,7 @@ def compute_matrices(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         dropna=False,
     ).astype(int)
 
-    # 按参照方和候选方支持度排序；空值固定放最后
+    # 按illion和finv支持度排序；空值固定放最后
     row_order = list(counts.sum(axis=1).sort_values(ascending=False).index)
     col_order = list(counts.sum(axis=0).sort_values(ascending=False).index)
     if EMPTY_LABEL in row_order:
@@ -685,8 +689,8 @@ def build_difference_details(df: pd.DataFrame, config: ReportConfig) -> pd.DataF
     available = [col for col in preferred_columns if col in diff_df.columns]
 
     result = diff_df[available].copy()
-    result["参照方Category_标准化"] = diff_df["__ref_display"]
-    result["候选方Category_标准化"] = diff_df["__cand_display"]
+    result["illion Category_标准化"] = diff_df["__ref_display"]
+    result["finv Category_标准化"] = diff_df["__cand_display"]
     result["Category比对状态"] = diff_df["__status_cn"]
 
     # 让核心比对字段靠前
@@ -694,8 +698,8 @@ def build_difference_details(df: pd.DataFrame, config: ReportConfig) -> pd.DataF
         "Category比对状态",
         config.reference_category,
         config.candidate_category,
-        "参照方Category_标准化",
-        "候选方Category_标准化",
+        "illion Category_标准化",
+        "finv Category_标准化",
     ]
     leading = [c for c in leading if c in result.columns]
     remaining = [c for c in result.columns if c not in leading]
@@ -872,7 +876,7 @@ def write_heatmap_sheet(
 
     # ── Count matrix ───────────────────────────────────────────────
     count = count_matrix.copy()
-    count.index.name = "参照方 Category \\ 候选方 Category"
+    count.index.name = "illion Category \\ finv Category"
     count.to_excel(writer, sheet_name=sheet_name, startrow=2)
     style_title(ws, "Category 对比热力图", "上方: 数量 | 下方: 行占比")
     style_header(ws, 3)
@@ -882,9 +886,9 @@ def write_heatmap_sheet(
 
     # ── Row % matrix ───────────────────────────────────────────────
     row_pct = row_pct_matrix.copy()
-    row_pct.index.name = "参照方 Category \\ 候选方 Category"
+    row_pct.index.name = "illion Category \\ finv Category"
     row_pct_start = count_end
-    style_section_title(ws, row_pct_start, "行占比（每个参照方 Category 的候选方流向，行合计 100%）", count_matrix.shape[1] + 1)
+    style_section_title(ws, row_pct_start, "行占比（每个illion Category 的finv流向，行合计 100%）", count_matrix.shape[1] + 1)
     row_pct.to_excel(writer, sheet_name=sheet_name, startrow=row_pct_start + 1)
     style_header(ws, row_pct_start + 2)
 
@@ -977,13 +981,13 @@ def write_core_sheet(
         ws,
         cat_header,
         len(category_comparison),
-        ["参照方Category一致率", "双方非空时一致率"],
+        ["illion Category一致率", "双方非空时一致率"],
     )
     apply_count_data_bar(
         ws,
         cat_header,
         len(category_comparison),
-        ["流向其他Category", "候选方缺失"],
+        ["流向其他Category", "finv缺失"],
     )
 
     # Section 3: 主要差异流向
@@ -1003,8 +1007,8 @@ def write_core_sheet(
         "说明": 44,
         "Category": 28,
         "主要差异去向": 44,
-        "参照方Category": 28,
-        "候选方Category": 28,
+        "illion Category": 28,
+        "finv Category": 28,
         "差异类型": 20,
     })
     set_base_font(ws, max_rows=ws.max_row)
@@ -1023,7 +1027,7 @@ def write_detail_sheet(
     output.to_excel(writer, sheet_name=sheet_name, index=False, startrow=2)
     ws = writer.book[sheet_name]
     subtitle = (
-        f"仅包含分类不一致、仅参照方有值、仅候选方有值。"
+        f"仅包含分类不一致、仅illion有值、仅finv有值。"
         f"共 {len(details):,} 行"
         + (f"，当前仅输出前 {len(output):,} 行" if truncated else "")
     )
@@ -1055,8 +1059,8 @@ def write_detail_sheet(
         "Category比对状态": 20,
         config.reference_category: 24,
         config.candidate_category: 24,
-        "参照方Category_标准化": 26,
-        "候选方Category_标准化": 26,
+        "illion Category_标准化": 26,
+        "finv Category_标准化": 26,
         "text": 48,
         "classification_reason": 50,
         "third_party": 30,
@@ -1150,10 +1154,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input", default=str(DEFAULT_INPUT), help="输入 Excel 路径")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="输出 Excel 路径")
     parser.add_argument("--sheet", default="transactions", help="输入 Sheet 名")
-    parser.add_argument("--reference-category", default="category", help="参照方 Category 字段")
-    parser.add_argument("--candidate-category", default="finv_category", help="候选方 Category 字段")
-    parser.add_argument("--reference-label", default="illion", help="参照方显示名称")
-    parser.add_argument("--candidate-label", default="finv", help="候选方显示名称")
+    parser.add_argument("--reference-category", default="category", help="illion Category 字段")
+    parser.add_argument("--candidate-category", default="finv_category", help="finv Category 字段")
+    parser.add_argument("--reference-label", default="illion", help="illion显示名称")
+    parser.add_argument("--candidate-label", default="finv", help="finv显示名称")
     parser.add_argument("--alias-json", default=None, help="可选 Category alias JSON")
     parser.add_argument("--top-n", type=int, default=20, help="核心页展示的差异流向 Top N")
     parser.add_argument(
@@ -1206,7 +1210,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     print("[3/6] Computing core metrics and Category-level differences...")
     summary, summary_table = compute_summary(prepared_df, config)
-    category_comparison = compute_category_comparison(prepared_df, display_map)
+    category_comparison = compute_category_comparison(prepared_df, display_map, config)
     difference_flows = compute_difference_flows(prepared_df)
 
     print("[4/6] Building heatmaps...")

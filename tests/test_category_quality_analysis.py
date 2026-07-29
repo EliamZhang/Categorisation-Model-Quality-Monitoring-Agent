@@ -59,13 +59,14 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         self.assertEqual(counts.get("both_empty", 0), 0)
 
     def test_per_category_mismatch_counts(self) -> None:
-        df, display_map = prepare_comparison_data(metric_fixture(), make_config())
-        cmp = compute_category_comparison(df, display_map)
+        config = make_config()
+        df, display_map = prepare_comparison_data(metric_fixture(), config)
+        cmp = compute_category_comparison(df, display_map, config)
         external = cmp.loc[cmp["Category"] == "External Transfers"].iloc[0]
-        self.assertEqual(external["参照方数量"], 4)
+        self.assertEqual(external["illion数量"], 4)
         self.assertEqual(external["一致数量"], 1)
         self.assertEqual(external["流向其他Category"], 2)
-        self.assertEqual(external["候选方缺失"], 1)
+        self.assertEqual(external["finv缺失"], 1)
 
     def test_matrices_row_pct(self) -> None:
         df, _ = prepare_comparison_data(metric_fixture(), make_config())
@@ -88,7 +89,7 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         config = make_config(output)
         df, display_map = prepare_comparison_data(metric_fixture(), config)
         summary, summary_table = compute_summary(df, config)
-        category_comparison = compute_category_comparison(df, display_map)
+        category_comparison = compute_category_comparison(df, display_map, config)
         difference_flows = compute_difference_flows(df)
         count_matrix, row_pct_matrix = compute_matrices(df)
         details = build_difference_details(df, config)
