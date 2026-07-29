@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 
-import inspect
 import unittest
 from pathlib import Path
 
 import openpyxl
 import pandas as pd
 
-import category_quality_analysis as analysis
-from category_quality_analysis import compute_all_metrics
+import category_quality_metrics as metrics
+from category_quality_metrics import compute_all_metrics
 
 
 def metric_fixture() -> pd.DataFrame:
@@ -79,89 +78,21 @@ class CategoryQualityMetricsTest(unittest.TestCase):
         self.assertEqual(finv_only["Retail"]["illion为空"], 1)
         self.assertNotIn("illion为All Other Credits", finv_only["Retail"])
 
-    def test_ai_metrics_and_workbook_sections(self) -> None:
-        compute_ai_metrics = getattr(
-            analysis,
-            "compute_ai_metrics",
-            lambda _rows, _todos: {},
-        )
-        ai_metrics = compute_ai_metrics(
-            [
-                {"judgment": "illion更准"},
-                {"judgment": "illion更准"},
-                {"judgment": "finv更准"},
-                {"judgment": "都合理"},
-                {"judgment": "都不对"},
-                {"judgment": "不确定"},
-                {"judgment": "parse_error"},
-            ],
-            [{"action": "one"}, {"action": "two"}],
-        )
-
-        self.assertEqual(ai_metrics.get("ai_success_count"), 6)
-        self.assertEqual(ai_metrics.get("ai_success_pct"), 85.71)
-        self.assertEqual(ai_metrics.get("ai_illion_better_pct"), 33.33)
-        self.assertEqual(ai_metrics.get("ai_both_wrong_count"), 1)
-        self.assertEqual(ai_metrics.get("ai_uncertain_count"), 1)
-        self.assertEqual(ai_metrics.get("ai_failed_count"), 1)
-        self.assertEqual(ai_metrics.get("ai_todo_count"), 2)
-
-        self.assertIn(
-            "ai_metrics",
-            inspect.signature(analysis.write_metrics_xlsx).parameters,
-        )
-
+    def test_metrics_workbook_sections(self) -> None:
         output = Path(self._testMethodName + ".xlsx")
         self.addCleanup(output.unlink, missing_ok=True)
         results = compute_all_metrics(metric_fixture())
-        analysis.write_metrics_xlsx(
+        metrics.write_metrics_xlsx(
             results,
             results["category_ranking"],
             pd.DataFrame(),
             output,
-            ai_metrics,
         )
 
         workbook = openpyxl.load_workbook(output, data_only=False)
         self.assertTrue(
             {"illion_only_categories", "finv_only_categories"}
             .issubset(workbook.sheetnames)
-        )
-        summary_text = " ".join(
-            str(cell.value or "")
-            for row in workbook["summary"].iter_rows()
-            for cell in row
-        )
-        self.assertIn("AI分析", summary_text)
-
-    def test_load_existing_ai_analysis_drops_excel_index_column(self) -> None:
-        path = Path(self._testMethodName + ".xlsx")
-        self.addCleanup(path.unlink, missing_ok=True)
-        with pd.ExcelWriter(path, engine="openpyxl") as writer:
-            pd.DataFrame({
-                "序号": [1],
-                "judgment": ["illion更准"],
-            }).to_excel(writer, sheet_name="ai_row_analysis", index=False)
-            pd.DataFrame({
-                "序号": [1],
-                "action": ["one"],
-            }).to_excel(writer, sheet_name="todos", index=False)
-
-        loader = getattr(analysis, "load_existing_ai_analysis", None)
-        self.assertIsNotNone(loader)
-        rows, todos = loader(path)
-
-        self.assertEqual(rows, [{"judgment": "illion更准"}])
-        self.assertEqual(todos, [{"action": "one"}])
-
-    def test_live_ai_analysis_is_default_with_optional_reuse(self) -> None:
-        self.assertFalse(analysis.parse_args([]).reuse_ai_analysis)
-        self.assertTrue(
-            analysis.parse_args(["--reuse-ai-analysis"]).reuse_ai_analysis
-        )
-        self.assertFalse(analysis.parse_args([]).skip_ai)
-        self.assertTrue(
-            analysis.parse_args(["--skip-ai"]).skip_ai
         )
 
 

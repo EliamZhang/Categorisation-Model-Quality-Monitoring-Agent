@@ -4,14 +4,11 @@ Category Quality Metrics — 纯指标计算
 ======================================
 计算 illion / finv 的 category 和 counterparty 有效覆盖率、不一致率、排行，
 输出 category_quality_metrics.xlsx。
-
-不含 AI 分析 —— 如需 AI 逐行分析，请使用 category_quality_analysis.py。
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 from typing import Any
 
@@ -23,24 +20,6 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # ═══════════════════════════════════════════════════════════════════
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-
-
-def _load_dotenv(path: Path | None = None) -> None:
-    """Load .env file into os.environ (no dependencies)."""
-    env_file = path or (PROJECT_ROOT / ".env")
-    if not env_file.exists():
-        return
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        key, val = key.strip(), val.strip()
-        if key and key not in os.environ:
-            os.environ[key] = val
-
-
-_load_dotenv()
 
 INPUT_FILE = PROJECT_ROOT / "classification_report.xlsx"
 OUTPUT_METRICS = PROJECT_ROOT / "category_quality_metrics.xlsx"
@@ -309,11 +288,10 @@ def sample_disagreements(df: pd.DataFrame) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════
 
 def write_metrics_xlsx(results: dict, ranking: list[dict],
-                       sample_df: pd.DataFrame, path: Path,
-                       ai_metrics: dict[str, Any] | None = None) -> None:
+                       sample_df: pd.DataFrame, path: Path) -> None:
     """写入指标 xlsx."""
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        _write_summary_sheet(writer, results, ai_metrics)
+        _write_summary_sheet(writer, results)
         _write_ranking_sheet(writer, ranking)
         _write_distribution_sheet(
             writer, "illion_only_categories", results["illion_only_categories"]
@@ -330,8 +308,7 @@ def write_metrics_xlsx(results: dict, ranking: list[dict],
             _auto_width(ws)
 
 
-def _write_summary_sheet(writer, results: dict,
-                         ai_metrics: dict[str, Any] | None = None) -> None:
+def _write_summary_sheet(writer, results: dict) -> None:
     n = results["total_rows"]
     rows = [
         ["指标", "数值", "说明"],
@@ -402,39 +379,6 @@ def _write_summary_sheet(writer, results: dict,
          f"{results['cp_exact_match_count']:,} / {results['cp_both_count']:,} = {results['cp_exact_match_pct']}%",
          ""],
     ]
-
-    if ai_metrics is not None:
-        rows.extend([
-            [""],
-            ["═══ 8. AI分析（严格不一致抽样） ═══"],
-            ["AI 抽样行数",
-             f"{ai_metrics['ai_total_count']:,}",
-             "仅针对严格不一致样本；不代表全量交易准确率"],
-            ["AI 成功解析",
-             f"{ai_metrics['ai_success_count']:,} / {ai_metrics['ai_total_count']:,} = {ai_metrics['ai_success_pct']}%",
-             "以下 AI 判断占比均以成功解析行数为分母"],
-            ["illion 更准",
-             f"{ai_metrics['ai_illion_better_count']:,} / {ai_metrics['ai_success_count']:,} = {ai_metrics['ai_illion_better_pct']}%",
-             "AI 判断 illion 的类别更准确"],
-            ["finv 更准",
-             f"{ai_metrics['ai_finv_better_count']:,} / {ai_metrics['ai_success_count']:,} = {ai_metrics['ai_finv_better_pct']}%",
-             "AI 判断 finv 的类别更准确"],
-            ["双方都合理",
-             f"{ai_metrics['ai_both_reasonable_count']:,} / {ai_metrics['ai_success_count']:,} = {ai_metrics['ai_both_reasonable_pct']}%",
-             "双方分类都可接受"],
-            ["双方都不对",
-             f"{ai_metrics['ai_both_wrong_count']:,} / {ai_metrics['ai_success_count']:,} = {ai_metrics['ai_both_wrong_pct']}%",
-             "AI 判断两边分类均不准确"],
-            ["AI 不确定",
-             f"{ai_metrics['ai_uncertain_count']:,} / {ai_metrics['ai_success_count']:,} = {ai_metrics['ai_uncertain_pct']}%",
-             "交易文本不足以判断"],
-            ["AI 失败（API/解析）",
-             f"{ai_metrics['ai_failed_count']:,} / {ai_metrics['ai_total_count']:,} = {ai_metrics['ai_failed_pct']}%",
-             "未成功解析的 AI 返回"],
-            ["AI 生成 finv TODO",
-             f"{ai_metrics['ai_todo_count']:,}",
-             "详见 disagreement_ai_analysis.xlsx 的 todos"],
-        ])
 
     df = pd.DataFrame(rows)
     df.to_excel(writer, sheet_name="summary", index=False, header=False)
