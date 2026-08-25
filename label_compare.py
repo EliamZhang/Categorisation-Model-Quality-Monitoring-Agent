@@ -7,8 +7,8 @@ detail-sheet logic from ``label_compare.py`` while changing the core report:
 1. Adds per-category Illion and finv coverage rates after the count columns.
 2. Adds Venn-like category metrics: intersection count, each side's exclusive
    count, and the three shares over the category union.
-3. Sorts the category comparison by Illion-side difference rate (difference
-   degree) rather than Illion-side difference count.
+3. Sorts the category comparison by intersection share over the union
+   (ascending, worst agreement first) rather than difference count or rate.
 4. Adds a business-group clustering view (income / expense / loan / transfer,
    plus an unclassified bucket) with per-group coverage, agreement and
    cross-group difference rates on a dedicated sheet.
@@ -2626,7 +2626,6 @@ def compute_category_comparison_v2(
     intersection_share_col = "交集占比（并集）"
     ref_only_share_col = f"{r}独有占比（并集）"
     cand_only_share_col = f"{c}独有占比（并集）"
-    difference_rate_col = f"{r}侧差异率"
     total_rows = len(df)
 
     original_columns = list(result.columns)
@@ -2677,12 +2676,12 @@ def compute_category_comparison_v2(
             )
     result = result[ordered_columns]
 
-    # Difference degree = Illion-side difference rate, not absolute count.
-    # Count remains a secondary key so high-rate categories with more evidence
-    # appear first when rates are tied.
+    # Intersection share over the union: low share (worst agreement) first.
+    # Union count remains a secondary key so categories with more evidence
+    # appear first when shares are tied.
     result = result.sort_values(
-        [difference_rate_col, f"{r}侧差异数", ref_count_col, "Category"],
-        ascending=[False, False, False, True],
+        [intersection_share_col, union_count_col, "Category"],
+        ascending=[True, False, True],
         kind="stable",
         na_position="last",
     ).reset_index(drop=True)
@@ -3000,7 +2999,7 @@ def write_core_sheet_v2(
     for row in range(summary_header_row, summary_header_row + len(summary_table) + 1):
         ws.cell(row, 6).value = None
     ws.cell(category_section_row, 1).value = (
-        f"2. 逐 Category 差异与优化优先级（按{config.reference_label}侧差异率/差异程度降序）"
+        "2. 逐 Category 差异与优化优先级（按交集占比（并集）升序）"
     )
 
     # Add rate color scales for coverage and Venn-share fields.
