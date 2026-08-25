@@ -138,6 +138,7 @@ DEFAULT_DETAIL_COLUMNS = [
     "bank_account_id",
     "transaction_date",
     "amount",
+    "balance",
     "dr_cr",
     "text",
     "category",
@@ -155,12 +156,11 @@ DETAIL_PRIORITY_ORDER = ["P1", "P2", "P3"]
 
 # 第三个 Sheet 默认隐藏的技术/追溯字段。
 # 字段仍保留在 Excel 中，需要时可以手动取消隐藏。
+# job_id 和 bank_account_id 需要人工排查时直接可见，默认不隐藏。
 DEFAULT_HIDDEN_DETAIL_COLUMNS = {
     "classification_engine",
     "classification_rule_id",
     "classification_status",
-    "job_id",
-    "bank_account_id",
     "sample_datetime",
 }
 
@@ -1246,6 +1246,7 @@ def build_difference_details(
     evidence_columns = [
         "transaction_date",
         config.amount_column,
+        "balance",
         "dr_cr",
         "text",
         "third_party",
