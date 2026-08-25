@@ -1,46 +1,23 @@
-# -*- coding: utf-8 -*-
 """
-Simplified Category Difference Report
-====================================
+Category difference report v2.
 
-用于比较两套 Category 输出，重点回答：
-1. 两边整体差异有多大？
-2. 哪些 Category 差异最大？
-3. 具体从哪个 Category 流向了哪个 Category？
-4. 哪些交易产生了差异？
+This version reuses the data cleaning, flow analysis, matrix generation and
+detail-sheet logic from ``label_compare.py`` while changing the core report:
 
-默认比较：
-- reference category: category（例如 illion）
-- candidate category: finv_category（例如 finv）
+1. Adds per-category Illion and finv coverage rates after the count columns.
+2. Adds Venn-like category metrics: intersection count, each side's exclusive
+   count, and the three shares over the category union.
+3. Sorts the category comparison by Illion-side difference rate (difference
+   degree) rather than Illion-side difference count.
+4. Adds a business-group clustering view (income / expense / loan / transfer,
+   plus an unclassified bucket) with per-group coverage, agreement and
+   cross-group difference rates on a dedicated sheet.
 
-输出 Excel 保留 3 个 Sheet：
-- 00_核心对比：关键指标、逐 Category 优先级分析、主要差异流向
-- 01_差异诊断地图：核心诊断指标、Top 差异流向、完整数量矩阵、差异流向占比及申请影响矩阵
-- 03_排查明细：按排查优先级组织不一致和单边缺失交易，默认隐藏次要技术字段
-
-其中“00_核心对比”的第二张表重点回答：
-- 哪些 reference Category 的差异数量最多？
-- 各 Category 对整体差异贡献多少？
-- 差异影响多少用户、申请和交易金额？
-- 主要流出/流入方向是什么？
-- 建议优先排查哪些 Category？
-
-说明：
-- reference 不一定是人工真值，因此本报告使用“一致率/差异率”，不使用 Accuracy、F1、Kappa 等容易被误解的指标。
-- Category 会先进行空值清洗、大小写/符号标准化，并可选使用 alias JSON 统一同义分类。
-- 热力图中的“(空)”表示该侧没有 Category。
-
-依赖：
-    pandas
-    numpy
-    openpyxl
-    python-calamine（可选；未安装时 .xlsx/.xlsm 自动回退到 openpyxl）
-
-示例：
-    python label_compare.py \
-        --input classification_report.xlsx \
-        --output category_difference_report.xlsx
+Illion is not treated as a golden standard. The directional difference rate is
+only a diagnostic view relative to the Illion-labelled population; the summary
+also exposes the symmetric union-sample difference rate.
 """
+
 
 from __future__ import annotations
 
@@ -48,7 +25,7 @@ import argparse
 import json
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -110,6 +87,35 @@ DEFAULT_KEY_CATEGORY_KEYWORDS = (
     "financial institution",
     "financial service",
 )
+
+# =====================================================================
+# 业务大类聚类：把细分 Category 归并到收入/支出/贷款/转账四大类，
+# 用于从大类层面观察覆盖率与一致率（详见 compute_group_comparison）。
+# =====================================================================
+
+# 大类展示顺序（汇总表与组×组矩阵共用；配置中的其他组按配置顺序追加）。
+DEFAULT_GROUP_LABELS = ("收入类", "支出类", "贷款类", "转账类")
+
+# 默认聚类关键词：Category 名经 normalize_scalar 标准化后按子串匹配，
+# 字典顺序即判定优先级——贷款类术语最具体放最前，支出类最后兜底。
+# 未命中任何关键词的 Category 归入 DEFAULT_UNGROUPED_LABEL。
+# 可通过 --group-json 提供整体替换。
+DEFAULT_CATEGORY_GROUP_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "贷款类": ("loan", "credit card", "repayment", "sacc", "overdrawn", "debt", "loc"),
+    "转账类": ("transfer", "osko", "bpay"),
+    "收入类": (
+        "wage", "salary", "centrelink", "income", "all other credit",
+        "refund", "deposit",
+    ),
+    "支出类": (
+        "dining", "grocer", "gambling", "automotive", "transport", "fee",
+        "retail", "subscription", "gym", "department", "travel", "rent",
+        "telecom", "health", "util", "entertainment", "insurance",
+        "personal care", "home improvement", "education", "pet",
+        "information", "donation", "dishonour",
+    ),
+}
+DEFAULT_UNGROUPED_LABEL = "未分类"
 
 # 建议优先级规则（保持简单、可解释）：
 # P1：差异数位于正差异 Category 的前 25%，且差异贡献率 >= 5% 或差异率 >= 30%；
@@ -214,6 +220,11 @@ class ReportConfig:
     top_n: int = 20
     max_detail_rows: int = EXCEL_MAX_DATA_ROWS
     detail_columns: tuple[str, ...] = tuple(DEFAULT_DETAIL_COLUMNS)
+    # 业务大类聚类：Category 名 → 大类；未命中归入 ungrouped_label。
+    group_keywords: Mapping[str, tuple[str, ...]] = field(
+        default_factory=lambda: dict(DEFAULT_CATEGORY_GROUP_KEYWORDS)
+    )
+    ungrouped_label: str = DEFAULT_UNGROUPED_LABEL
 
     @property
     def required_columns(self) -> list[str]:
@@ -1403,7 +1414,7 @@ def format_dataframe_region(ws, header_row: int, data_rows: int) -> None:
                 cell.number_format = "#,##0;[Red]-#,##0"
             elif any(token in h for token in [
                 "数量", "总数", "差异数", "用户数", "申请数", "变动数",
-                "分子", "分母", "排名", "count",
+                "分子", "分母", "排名", "count", "有值",
             ]):
                 cell.number_format = "#,##0"
 
@@ -1777,6 +1788,101 @@ def write_heatmap_sheet(
         "主要交易方向": 20,
         "排查建议": 48,
     }, max_width=48)
+
+
+def write_group_sheet(
+    writer: pd.ExcelWriter,
+    group_comparison: pd.DataFrame,
+    group_matrix: pd.DataFrame,
+    config: ReportConfig,
+) -> None:
+    """生成业务大类聚类对比 Sheet：大类汇总表 + 组×组流向矩阵。"""
+    sheet_name = "02_业务聚类对比"
+    ws = writer.book.create_sheet(sheet_name)
+    r = config.reference_label
+    c = config.candidate_label
+    end_col = max(8, len(group_comparison.columns), group_matrix.shape[1] + 1)
+    subtitle = (
+        f"按业务大类（收入/支出/贷款/转账，未命中的归入「{config.ungrouped_label}」）汇总；"
+        f"一致率以 {r} 侧为分母；矩阵对角线为大类一致（仍可能包含 Category 不同的行）"
+    )
+    style_title(ws, "业务大类聚类对比", subtitle, end_col=end_col)
+    configure_sheet_view(ws, freeze_panes="A5")
+
+    # Section 1: 大类聚类汇总表
+    row = 4
+    style_section_title(
+        ws,
+        row,
+        "1. 大类聚类汇总（覆盖率 / 一致率 / 跨组差异）",
+        len(group_comparison.columns),
+    )
+    header_row = row + 1
+    group_comparison.to_excel(
+        writer, sheet_name=sheet_name, index=False, startrow=header_row - 1
+    )
+    style_header(ws, header_row)
+    format_dataframe_region(ws, header_row, len(group_comparison))
+    apply_rate_color_scale(
+        ws,
+        header_row,
+        len(group_comparison),
+        [f"{r}覆盖率", f"{c}覆盖率", "大类一致率", "精确一致率"],
+    )
+    apply_difference_rate_color_scale(
+        ws,
+        header_row,
+        len(group_comparison),
+        ["组内类别不一致率", "跨组差异率"],
+    )
+    apply_count_data_bar(
+        ws,
+        header_row,
+        len(group_comparison),
+        [
+            "双方同大类数量",
+            "精确一致数量",
+            "组内类别不一致数量",
+            "跨组流出数量",
+            f"仅{r}有值",
+            f"仅{c}有值",
+        ],
+    )
+
+    # 首行「合计」加蓝底，未分类行加灰底，便于快速定位。
+    for i, value in enumerate(group_comparison["业务大类"]):
+        excel_row = header_row + 1 + i
+        fill_color = LIGHT_BLUE if i == 0 else (
+            LIGHT_GRAY if value == config.ungrouped_label else None
+        )
+        if fill_color:
+            for col in range(1, len(group_comparison.columns) + 1):
+                ws.cell(excel_row, col).fill = PatternFill("solid", fgColor=fill_color)
+
+    # Section 2: 组×组流向矩阵
+    matrix_row = header_row + len(group_comparison) + 2
+    write_matrix_section(
+        writer,
+        ws,
+        sheet_name,
+        group_matrix,
+        matrix_row,
+        (
+            f"2. 组×组流向矩阵（行={r} 大类，列={c} 大类；"
+            f"对角线为大类一致，含「{config.ungrouped_label}」）"
+        ),
+        f"{r} 大类 \\ {c} 大类",
+        percent=False,
+        mode="full_count",
+    )
+
+    ws.sheet_properties.tabColor = GREEN
+    set_widths(ws, {
+        "业务大类": 14,
+        "成员数量": 12,
+        "成员Category": 52,
+        "主要跨组流向": 26,
+    }, max_width=52)
 
 
 def style_detail_header(ws, row: int, config: ReportConfig) -> None:
@@ -2244,6 +2350,21 @@ def print_summary(summary: Mapping[str, Any], config: ReportConfig) -> None:
     print(f"All differences: {summary['all_difference_count']:,}")
 
 
+def print_group_summary(group_comparison: pd.DataFrame, config: ReportConfig) -> None:
+    """控制台打印业务大类聚类摘要（覆盖率 / 大类一致率 / 精确一致率）。"""
+    r = config.reference_label
+    c = config.candidate_label
+    print("\n--- 业务大类聚类 ---")
+    for _, row in group_comparison.iterrows():
+        name = str(row["业务大类"])
+        print(
+            f"{name:<6} {r} {int(row[f'{r}数量']):>7,} ({row[f'{r}覆盖率']:>6.1%}) | "
+            f"{c} {int(row[f'{c}数量']):>7,} ({row[f'{c}覆盖率']:>6.1%}) | "
+            f"大类一致 {row['大类一致率']:>6.1%} | 精确一致 {row['精确一致率']:>6.1%} | "
+            f"跨组差异 {row['跨组差异率']:>6.1%}"
+        )
+
+
 # =====================================================================
 # CLI
 # =====================================================================
@@ -2272,6 +2393,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="关键Category关键词，使用英文逗号分隔；标准化后按包含关系匹配",
     )
     parser.add_argument("--alias-json", default=None, help="可选 Category alias JSON")
+    parser.add_argument(
+        "--group-json",
+        default=None,
+        help="可选 业务大类聚类 JSON：{\"组名\": [\"关键词\",...]}；提供时整体替换内置默认聚类（收入/支出/贷款/转账）",
+    )
     parser.add_argument("--top-n", type=int, default=20, help="核心页展示的差异流向 Top N")
     parser.add_argument(
         "--max-detail-rows",
@@ -2314,6 +2440,9 @@ def build_config(args: argparse.Namespace) -> ReportConfig:
         amount_column=args.amount_column,
         key_category_keywords=key_category_keywords,
         alias_json=Path(args.alias_json).expanduser().resolve() if args.alias_json else None,
+        group_keywords=load_group_keywords(
+            Path(args.group_json).expanduser().resolve() if args.group_json else None
+        ),
         top_n=args.top_n,
         max_detail_rows=args.max_detail_rows,
         detail_columns=detail_columns,
@@ -2377,6 +2506,1171 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     print(f"\nReport written to: {config.output_path}")
     print("=" * 72)
+
+
+V2_DEFAULT_OUTPUT = Path(__file__).resolve().parent / "category_difference_report_v2.xlsx"
+
+
+def compute_summary_v2(
+    df: pd.DataFrame,
+    config: ReportConfig,
+) -> tuple[dict, pd.DataFrame]:
+    """Extend the existing summary with explicit symmetric and directional rates."""
+    summary, table = compute_summary(df, config)
+
+    r = config.reference_label
+    c = config.candidate_label
+    reference_side_difference_count = (
+        summary["mismatch_count"] + summary["reference_only_count"]
+    )
+    candidate_side_difference_count = (
+        summary["mismatch_count"] + summary["candidate_only_count"]
+    )
+    summary["reference_side_difference_count"] = reference_side_difference_count
+    summary["candidate_side_difference_count"] = candidate_side_difference_count
+    summary["reference_side_difference_rate"] = safe_div(
+        reference_side_difference_count, summary["reference_nonempty"]
+    )
+    summary["candidate_side_difference_rate"] = safe_div(
+        candidate_side_difference_count, summary["candidate_nonempty"]
+    )
+    union_nonempty_count = (
+        summary["both_nonempty"]
+        + summary["reference_only_count"]
+        + summary["candidate_only_count"]
+    )
+    summary["coverage_overlap_rate"] = safe_div(
+        summary["both_nonempty"], union_nonempty_count
+    )
+    summary["coverage_nonoverlap_rate"] = safe_div(
+        summary["reference_only_count"] + summary["candidate_only_count"],
+        union_nonempty_count,
+    )
+    # The former coverage-gap summary row is intentionally removed. Coverage
+    # overlap and one-sided coverage now carry the comparison more directly.
+    coverage_gap_label = f"{c} - {r} 覆盖率差"
+    table = table.loc[~table["指标"].eq(coverage_gap_label)].reset_index(drop=True)
+
+    extra_rows = pd.DataFrame([
+        {
+            "指标": "联合非空样本差异率",
+            "结果": summary["all_difference_rate_vs_union"],
+            "分子": summary["all_difference_count"],
+            "分母": summary["both_nonempty"]
+            + summary["reference_only_count"]
+            + summary["candidate_only_count"],
+            "说明": "分类不一致 + 两侧单边缺失，分母为至少一侧有分类的交易",
+            "格式": "percentage",
+        },
+        {
+            "指标": "覆盖重叠率",
+            "结果": summary["coverage_overlap_rate"],
+            "分子": summary["both_nonempty"],
+            "分母": union_nonempty_count,
+            "说明": "双方均有分类 / 至少一侧有分类；只衡量覆盖是否重叠",
+            "格式": "percentage",
+        },
+        {
+            "指标": "覆盖不重叠率",
+            "结果": summary["coverage_nonoverlap_rate"],
+            "分子": summary["reference_only_count"] + summary["candidate_only_count"],
+            "分母": union_nonempty_count,
+            "说明": "仅一侧有分类 / 至少一侧有分类；覆盖重叠率的补集",
+            "格式": "percentage",
+        },
+        {
+            "指标": f"相对{r}的方向性差异率",
+            "结果": summary["reference_side_difference_rate"],
+            "分子": reference_side_difference_count,
+            "分母": summary["reference_nonempty"],
+            "说明": f"双方不一致 + 仅{r}有值，分母为{r}有分类数量；不代表准确率",
+            "格式": "percentage",
+        },
+        {
+            "指标": f"相对{c}的方向性差异率",
+            "结果": summary["candidate_side_difference_rate"],
+            "分子": candidate_side_difference_count,
+            "分母": summary["candidate_nonempty"],
+            "说明": f"双方不一致 + 仅{c}有值，分母为{c}有分类数量；不代表准确率",
+            "格式": "percentage",
+        },
+    ])
+
+    insert_at = table.index[table["指标"].eq("Category 差异总数")]
+    insert_at = int(insert_at[0]) if len(insert_at) else len(table)
+    table = pd.concat(
+        [table.iloc[:insert_at], extra_rows, table.iloc[insert_at:]],
+        ignore_index=True,
+    )
+    return summary, table
+
+
+def compute_category_comparison_v2(
+    df: pd.DataFrame,
+    display_map: dict[str, str],
+    config: ReportConfig,
+) -> pd.DataFrame:
+    """Add category coverage fields and sort by difference degree."""
+    result = compute_category_comparison(df, display_map, config).copy()
+    if result.empty:
+        return result
+
+    r = config.reference_label
+    c = config.candidate_label
+    ref_count_col = f"{r}数量"
+    cand_count_col = f"{c}数量"
+    ref_rate_col = f"{r}覆盖率"
+    cand_rate_col = f"{c}覆盖率"
+    union_count_col = "并集数量"
+    cand_only_count_col = f"{c}独有数量"
+    intersection_share_col = "交集占比（并集）"
+    ref_only_share_col = f"{r}独有占比（并集）"
+    cand_only_share_col = f"{c}独有占比（并集）"
+    difference_rate_col = f"{r}侧差异率"
+    total_rows = len(df)
+
+    original_columns = list(result.columns)
+    result[ref_rate_col] = result[ref_count_col] / total_rows if total_rows else 0.0
+    result[cand_rate_col] = result[cand_count_col] / total_rows if total_rows else 0.0
+
+    # Treat the two model outputs as two sets for each Category:
+    # A = Illion assigned this Category; B = finv assigned this Category.
+    # The Venn denominator is |A union B|, so the three shares sum to 100%.
+    intersection_count = pd.to_numeric(result["一致数量"], errors="coerce").fillna(0)
+    ref_only_count = pd.to_numeric(
+        result[f"{r}侧差异数"], errors="coerce"
+    ).fillna(0)
+    cand_only_count = (
+        pd.to_numeric(result[cand_count_col], errors="coerce").fillna(0)
+        - intersection_count
+    )
+    union_count = (
+        pd.to_numeric(result[ref_count_col], errors="coerce").fillna(0)
+        + pd.to_numeric(result[cand_count_col], errors="coerce").fillna(0)
+        - intersection_count
+    )
+    result[union_count_col] = union_count.astype(int)
+    result[cand_only_count_col] = cand_only_count.astype(int)
+    result[intersection_share_col] = intersection_count / union_count.replace(0, pd.NA)
+    result[ref_only_share_col] = ref_only_count / union_count.replace(0, pd.NA)
+    result[cand_only_share_col] = cand_only_count / union_count.replace(0, pd.NA)
+    result[[intersection_share_col, ref_only_share_col, cand_only_share_col]] = (
+        result[[intersection_share_col, ref_only_share_col, cand_only_share_col]]
+        .fillna(0.0)
+    )
+
+    # Put coverage directly after the two count columns for quick comparison.
+    ordered_columns: list[str] = []
+    for column in original_columns:
+        ordered_columns.append(column)
+        if column == cand_count_col:
+            ordered_columns.extend(
+                [
+                    ref_rate_col,
+                    cand_rate_col,
+                    union_count_col,
+                    cand_only_count_col,
+                    intersection_share_col,
+                    ref_only_share_col,
+                    cand_only_share_col,
+                ]
+            )
+    result = result[ordered_columns]
+
+    # Difference degree = Illion-side difference rate, not absolute count.
+    # Count remains a secondary key so high-rate categories with more evidence
+    # appear first when rates are tied.
+    result = result.sort_values(
+        [difference_rate_col, f"{r}侧差异数", ref_count_col, "Category"],
+        ascending=[False, False, False, True],
+        kind="stable",
+        na_position="last",
+    ).reset_index(drop=True)
+
+    # Recalculate contribution and cumulative contribution after resorting so
+    # the cumulative column remains meaningful in the displayed order.
+    total_reference_difference = int(result[f"{r}侧差异数"].sum())
+    if total_reference_difference > 0:
+        result["差异贡献率"] = (
+            result[f"{r}侧差异数"] / total_reference_difference
+        )
+        result["累计差异贡献率"] = result["差异贡献率"].cumsum().clip(upper=1.0)
+    return result
+
+
+# =====================================================================
+# Category business-group clustering (收入/支出/贷款/转账 + 未分类)
+# =====================================================================
+
+def load_group_keywords(path: Path | None) -> dict[str, tuple[str, ...]]:
+    """加载业务大类聚类 JSON：{"组名": ["关键词", ...]}。
+
+    提供时整体替换内置默认聚类；关键词与 Category 名一样会经过
+    normalize_scalar 标准化后再做子串匹配。
+    """
+    if path is None:
+        return dict(DEFAULT_CATEGORY_GROUP_KEYWORDS)
+    if not path.exists():
+        raise FileNotFoundError(f"Group JSON 不存在: {path}")
+
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError("Group JSON 顶层必须是对象(dict)。")
+
+    groups: dict[str, tuple[str, ...]] = {}
+    for group_name, keywords in payload.items():
+        if isinstance(keywords, str):
+            items = [kw.strip() for kw in keywords.split(",") if kw.strip()]
+        elif isinstance(keywords, list):
+            items = [str(kw).strip() for kw in keywords if str(kw).strip()]
+        else:
+            raise ValueError(
+                f"Group JSON 中 '{group_name}' 的关键词必须是列表或逗号分隔字符串。"
+            )
+        if items:
+            groups[str(group_name)] = tuple(items)
+    return groups
+
+
+def group_display_order(config: ReportConfig) -> list[str]:
+    """汇总表与矩阵共用的大类顺序：默认四类 → 配置中的其他类 → 未分类。"""
+    configured = list(config.group_keywords.keys())
+    ordered = [group for group in DEFAULT_GROUP_LABELS if group in configured]
+    ordered += [group for group in configured if group not in ordered]
+    ordered += [config.ungrouped_label]
+    seen: list[str] = []
+    for group in ordered:
+        if group not in seen:
+            seen.append(group)
+    return seen
+
+
+def build_category_group_lookup(
+    group_keywords: Mapping[str, Sequence[str]],
+    categories: Sequence[str],
+) -> dict[str, str]:
+    """为每个标准化 Category key 分配业务大类；无匹配的 key 不出现在结果中。
+
+    关键词与 Category 名都经 normalize_scalar 标准化后做子串匹配；
+    按 group_keywords 的插入顺序判断，首个命中的组胜出（调用方应把
+    更具体的组放在前面）。
+    """
+    normalized_groups: list[tuple[str, tuple[str, ...]]] = []
+    for group_name, keywords in group_keywords.items():
+        normalized: list[str] = []
+        for keyword in keywords:
+            key = normalize_scalar(keyword)
+            if not pd.isna(key):
+                normalized.append(str(key))
+        if normalized:
+            normalized_groups.append((group_name, tuple(normalized)))
+
+    lookup: dict[str, str] = {}
+    for category in categories:
+        category_key = normalize_scalar(category)
+        if pd.isna(category_key):
+            continue
+        text = str(category_key)
+        for group_name, keywords in normalized_groups:
+            if any(keyword in text for keyword in keywords):
+                lookup[text] = group_name
+                break
+    return lookup
+
+
+def assign_group_columns(df: pd.DataFrame, config: ReportConfig) -> None:
+    """给 prepared df 添加 __ref_group / __cand_group 业务大类列（原地修改）。"""
+    all_categories = sorted(
+        set(df["__ref_key"].dropna().astype(str))
+        | set(df["__cand_key"].dropna().astype(str))
+    )
+    lookup = build_category_group_lookup(config.group_keywords, all_categories)
+    df["__ref_group"] = (
+        df["__ref_key"].map(lookup).fillna(config.ungrouped_label).astype("string")
+    )
+    df["__cand_group"] = (
+        df["__cand_key"].map(lookup).fillna(config.ungrouped_label).astype("string")
+    )
+
+
+def compute_group_comparison(
+    df: pd.DataFrame,
+    display_map: Mapping[str, str],
+    config: ReportConfig,
+) -> pd.DataFrame:
+    """聚类到业务大类后，按 reference 侧方向统计每个大类的覆盖与一致情况。
+
+    口径（与逐 Category 表一致的方向性口径，reference 侧为分母）：
+    - 大类一致率 = 双方落入同一大类 / reference 侧属于该大类；
+    - 精确一致率 = 双方 Category 完全相同 / reference 侧属于该大类；
+    - 组内类别不一致 = 双方同大类但 Category 不同；
+    - 跨组差异率 = reference 在该大类、finv 在其他大类 / reference 侧属于该大类。
+
+    首行为「合计」（全部交易，含未分类行），其后为各大类，未分类最后。
+    """
+    n = len(df)
+    status = df["__status"].astype("string")
+    exact = status.isin(["exact_match", "normalized_match"])
+    ref_has = df["__ref_key"].notna()
+    cand_has = df["__cand_key"].notna()
+    same_group = ref_has & cand_has & df["__ref_group"].eq(df["__cand_group"])
+    r = config.reference_label
+    c = config.candidate_label
+
+    group_order = group_display_order(config)
+    group_keys = {
+        group: sorted(
+            set(df.loc[df["__ref_group"].eq(group), "__ref_key"].dropna().astype(str))
+            | set(df.loc[df["__cand_group"].eq(group), "__cand_key"].dropna().astype(str))
+        )
+        for group in group_order
+    }
+    all_keys = sorted(
+        set(df["__ref_key"].dropna().astype(str))
+        | set(df["__cand_key"].dropna().astype(str))
+    )
+
+    def build_row(group_name: str | None) -> dict[str, Any]:
+        if group_name is None:
+            ref_in = pd.Series(True, index=df.index)
+            cand_in = pd.Series(True, index=df.index)
+            member_keys = all_keys
+        else:
+            ref_in = df["__ref_group"].eq(group_name)
+            cand_in = df["__cand_group"].eq(group_name)
+            member_keys = group_keys.get(group_name, [])
+
+        same_g = same_group & ref_in
+        exact_g = same_g & exact
+        diff_cat_g = same_g & ~exact
+        ref_only = ref_in & ref_has & ~cand_has
+        cand_only = cand_in & cand_has & ~ref_has
+        # 跨组流向 = 双方都有值但落入不同大类（ref 侧属于本组）。
+        cross = ref_in & ref_has & cand_has & ~same_group
+
+        ref_count = int(ref_in.sum())
+        cand_count = int(cand_in.sum())
+        cross_count = int(cross.sum())
+
+        return {
+            "业务大类": group_name or "合计",
+            "成员数量": len(member_keys),
+            "成员Category": (
+                "; ".join(display_map.get(key, key) for key in member_keys) or "-"
+            ),
+            f"{r}数量": ref_count,
+            f"{r}覆盖率": safe_div(ref_count, n),
+            f"{c}数量": cand_count,
+            f"{c}覆盖率": safe_div(cand_count, n),
+            "覆盖率差": safe_div(cand_count, n) - safe_div(ref_count, n),
+            "双方同大类数量": int(same_g.sum()),
+            "大类一致率": safe_div(same_g.sum(), ref_count),
+            "精确一致数量": int(exact_g.sum()),
+            "精确一致率": safe_div(exact_g.sum(), ref_count),
+            "组内类别不一致数量": int(diff_cat_g.sum()),
+            "组内类别不一致率": safe_div(diff_cat_g.sum(), ref_count),
+            "跨组流出数量": cross_count,
+            "跨组差异率": safe_div(cross_count, ref_count),
+            f"仅{r}有值": int(ref_only.sum()),
+            f"仅{c}有值": int(cand_only.sum()),
+            "主要跨组流向": top_category_text(df.loc[cross, "__cand_group"]),
+        }
+
+    rows = [build_row(None)] + [build_row(group) for group in group_order]
+    columns = [
+        "业务大类", "成员数量", "成员Category",
+        f"{r}数量", f"{r}覆盖率",
+        f"{c}数量", f"{c}覆盖率", "覆盖率差",
+        "双方同大类数量", "大类一致率",
+        "精确一致数量", "精确一致率",
+        "组内类别不一致数量", "组内类别不一致率",
+        "跨组流出数量", "跨组差异率",
+        f"仅{r}有值", f"仅{c}有值",
+        "主要跨组流向",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def compute_group_matrix(df: pd.DataFrame, config: ReportConfig) -> pd.DataFrame:
+    """组×组流向矩阵：行 = reference 大类，列 = finv 大类（含未分类）。
+
+    对角线为大类一致（其中仍可能包含 Category 不同的行），
+    非对角线为跨组差异；两侧都无分类的行落在「未分类 × 未分类」。
+    """
+    order = group_display_order(config)
+    matrix = pd.crosstab(
+        df["__ref_group"], df["__cand_group"], dropna=False
+    ).astype(int)
+    return matrix.reindex(index=order, columns=order, fill_value=0)
+
+
+def compute_group_views(
+    df: pd.DataFrame,
+    display_map: Mapping[str, str],
+    config: ReportConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """添加业务大类列并计算聚类汇总表与组×组流向矩阵。"""
+    assign_group_columns(df, config)
+    return (
+        compute_group_comparison(df, display_map, config),
+        compute_group_matrix(df, config),
+    )
+
+
+def build_core_display_category_comparison(
+    category_comparison: pd.DataFrame,
+    config: ReportConfig,
+) -> pd.DataFrame:
+    """Create a compact, Venn-like display copy for the core sheet.
+
+    Internal column names remain in ``category_comparison`` for matrix and
+    detail logic. The core sheet replaces those technical names with the
+    clearer Venn labels and avoids showing the same count twice.
+    """
+    r = config.reference_label
+    c = config.candidate_label
+    ref_count_col = f"{r}数量"
+    cand_count_col = f"{c}数量"
+    ref_rate_col = f"{r}覆盖率"
+    cand_rate_col = f"{c}覆盖率"
+    union_count_col = "并集数量"
+    ref_only_count_col = f"{r}独有数量"
+    cand_only_count_col = f"{c}独有数量"
+    intersection_share_col = "交集占比（并集）"
+    ref_only_share_col = f"{r}独有占比（并集）"
+    cand_only_share_col = f"{c}独有占比（并集）"
+    degree_col = "差异程度（相对illion）"
+
+    display = category_comparison.copy()
+    display["交集数量"] = display["一致数量"]
+    display[ref_only_count_col] = display[f"{r}侧差异数"]
+    display[degree_col] = display[f"{r}侧差异率"]
+
+    internal_columns = {"一致数量", f"{r}侧差异数", f"{r}侧差异率"}
+    display = display.drop(columns=list(internal_columns), errors="ignore")
+
+    primary_columns = [
+        "Category",
+        "关键Category",
+        "建议优先级",
+        ref_count_col,
+        cand_count_col,
+        ref_rate_col,
+        cand_rate_col,
+        union_count_col,
+        "交集数量",
+        ref_only_count_col,
+        cand_only_count_col,
+        intersection_share_col,
+        ref_only_share_col,
+        cand_only_share_col,
+        degree_col,
+    ]
+    primary_columns = [column for column in primary_columns if column in display.columns]
+    remaining_columns = [
+        column for column in display.columns if column not in primary_columns
+    ]
+    return display[primary_columns + remaining_columns]
+
+
+def write_core_sheet_v2(
+    writer,
+    summary_table: pd.DataFrame,
+    category_comparison: pd.DataFrame,
+    difference_flows: pd.DataFrame,
+    config: ReportConfig,
+) -> None:
+    """Reuse the established core-sheet style and update the new view labels."""
+    write_core_sheet(
+        writer,
+        summary_table,
+        category_comparison,
+        difference_flows,
+        config,
+    )
+    ws = writer.book["00_核心对比"]
+    summary_header_row = 5
+    category_section_row = summary_header_row + len(summary_table) + 2
+    category_header_row = category_section_row + 1
+    # The original writer hides column F because it used to be the summary's
+    # technical "格式" column. After adding category coverage fields, column F
+    # is Illion coverage in the category table and must remain visible.
+    ws.column_dimensions["F"].hidden = False
+    for row in range(summary_header_row, summary_header_row + len(summary_table) + 1):
+        ws.cell(row, 6).value = None
+    ws.cell(category_section_row, 1).value = (
+        f"2. 逐 Category 差异与优化优先级（按{config.reference_label}侧差异率/差异程度降序）"
+    )
+
+    # Add rate color scales for coverage and Venn-share fields.
+    apply_rate_color_scale(
+        ws,
+        category_header_row,
+        len(category_comparison),
+        [f"{config.reference_label}覆盖率", f"{config.candidate_label}覆盖率"],
+    )
+    apply_difference_rate_color_scale(
+        ws,
+        category_header_row,
+        len(category_comparison),
+        ["差异程度（相对illion）"],
+    )
+    apply_count_data_bar(
+        ws,
+        category_header_row,
+        len(category_comparison),
+        [
+            "交集数量",
+            f"{config.reference_label}独有数量",
+            f"{config.candidate_label}独有数量",
+        ],
+    )
+
+    header_map = {
+        str(ws.cell(category_header_row, col).value): col
+        for col in range(1, ws.max_column + 1)
+        if ws.cell(category_header_row, col).value is not None
+    }
+    degree_col = header_map.get("差异程度（相对illion）")
+    if degree_col:
+        for row in range(
+            category_header_row + 1,
+            category_header_row + len(category_comparison) + 1,
+        ):
+            ws.cell(row, degree_col).number_format = "0.00%"
+
+    # Keep the new columns usable without changing the existing layout system.
+    for header, width in {
+        f"{config.reference_label}覆盖率": 14,
+        f"{config.candidate_label}覆盖率": 14,
+        "并集数量": 14,
+        "交集数量": 14,
+        f"{config.reference_label}独有数量": 16,
+        f"{config.candidate_label}独有数量": 16,
+        "交集占比（并集）": 16,
+        f"{config.reference_label}独有占比（并集）": 20,
+        f"{config.candidate_label}独有占比（并集）": 20,
+        "差异程度（相对illion）": 20,
+    }.items():
+        col = header_map.get(header)
+        if col:
+            from openpyxl.utils import get_column_letter
+
+            ws.column_dimensions[get_column_letter(col)].width = width
+
+
+def write_report_v2(
+    config: ReportConfig,
+    summary_table: pd.DataFrame,
+    category_comparison: pd.DataFrame,
+    difference_flows: pd.DataFrame,
+    count_matrix: pd.DataFrame,
+    difference_row_pct_matrix: pd.DataFrame,
+    application_matrix: pd.DataFrame,
+    details: pd.DataFrame,
+    group_comparison: pd.DataFrame,
+    group_matrix: pd.DataFrame,
+    summary: dict | None = None,
+    prepared_df: pd.DataFrame | None = None,
+) -> bool:
+    """Write the v2 workbook while preserving the original report's other sheets."""
+    config.output_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(config.output_path, engine="openpyxl") as writer:
+        writer.book._named_styles["Normal"].font = Font(
+            name=EXCEL_FONT_NAME,
+            size=BODY_FONT_SIZE,
+            color=BLACK,
+        )
+        core_category_comparison = build_core_display_category_comparison(
+            category_comparison, config
+        )
+        write_core_sheet_v2(
+            writer,
+            summary_table,
+            core_category_comparison,
+            difference_flows,
+            config,
+        )
+        write_heatmap_sheet(
+            writer,
+            "01_差异诊断地图",
+            category_comparison,
+            difference_flows,
+            count_matrix,
+            difference_row_pct_matrix,
+            application_matrix,
+            config,
+        )
+        write_group_sheet(writer, group_comparison, group_matrix, config)
+        truncated = write_detail_sheet(writer, details, config)
+
+        # 04_模型监控 sheet
+        if summary is not None and prepared_df is not None:
+            _write_monitor_sheet(
+                writer, summary, category_comparison, prepared_df, config
+            )
+
+        writer.book.properties.title = "Category Difference Report v2"
+        writer.book.properties.subject = "Category coverage and difference comparison"
+        writer.book.properties.creator = "label_compare_v2.py"
+        writer.book.properties.description = (
+            f"Comparison report: {config.reference_label} vs {config.candidate_label}; "
+            "category coverage and difference-degree ranking"
+        )
+    return truncated
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    # Use a new default output so the original workbook is not overwritten.
+    if args.output == str(DEFAULT_OUTPUT):
+        args.output = str(V2_DEFAULT_OUTPUT)
+    config = build_config(args)
+
+    print(f"[1/6] Loading: {config.input_path}")
+    raw_df = load_data(config)
+    print(f"      Loaded {len(raw_df):,} rows, {len(raw_df.columns):,} columns")
+
+    print("[2/6] Cleaning and comparing Category values...")
+    prepared_df, display_map = prepare_comparison_data(raw_df, config)
+
+    print("[3/6] Computing v2 summary and Category differences...")
+    summary, summary_table = compute_summary_v2(prepared_df, config)
+    category_comparison = compute_category_comparison_v2(
+        prepared_df, display_map, config
+    )
+    difference_flows = compute_difference_flows(
+        prepared_df, config, category_comparison
+    )
+
+    print("[4/6] Building diagnostic matrices...")
+    count_matrix, difference_row_pct_matrix, application_matrix = compute_matrices(
+        prepared_df, category_comparison, config
+    )
+
+    print("      Clustering categories into business groups...")
+    group_comparison, group_matrix = compute_group_views(prepared_df, display_map, config)
+
+    print("[5/6] Building difference details...")
+    details = build_difference_details(prepared_df, category_comparison, config)
+
+    print("[6/6] Writing v2 Excel report...")
+    _save_monitor_snapshot(summary, category_comparison, prepared_df, config)
+    truncated = write_report_v2(
+        config,
+        summary_table,
+        category_comparison,
+        difference_flows,
+        count_matrix,
+        difference_row_pct_matrix,
+        application_matrix,
+        details,
+        group_comparison,
+        group_matrix,
+        summary=summary,
+        prepared_df=prepared_df,
+    )
+    print_summary(summary, config)
+    print_group_summary(group_comparison, config)
+    if truncated:
+        print(
+            f"Warning: difference details were truncated to "
+            f"{min(config.max_detail_rows, EXCEL_MAX_DATA_ROWS):,} rows."
+        )
+    print(f"\nReport written to: {config.output_path}")
+    print("=" * 72)
+
+
+# =====================================================================
+# Model monitoring: track illion vs finv difference trends over time
+# =====================================================================
+
+_MONITOR_DIR = Path(__file__).resolve().parent / ".monitor"
+_SNAPSHOT_PATH = _MONITOR_DIR / "snapshots.jsonl"
+
+
+def _save_monitor_snapshot(
+    summary: dict[str, Any],
+    category_comparison: pd.DataFrame,
+    prepared_df: pd.DataFrame,
+    config: ReportConfig,
+) -> None:
+    """Extract key metrics and append one line to the snapshot file."""
+    _MONITOR_DIR.mkdir(parents=True, exist_ok=True)
+
+    r = config.reference_label
+    c = config.candidate_label
+
+    summary_block: dict[str, Any] = {
+        "illion_coverage": summary.get("reference_coverage", 0),
+        "finv_coverage": summary.get("candidate_coverage", 0),
+        "agreement_rate": summary.get("agreement_rate_when_both_nonempty", 0),
+        "mismatch_count": int(summary.get("mismatch_count", 0)),
+        "mismatch_rate": summary.get("mismatch_rate_when_both_nonempty", 0),
+        "coverage_adjusted_agreement": summary.get("coverage_adjusted_agreement", 0),
+        "all_difference_count": int(summary.get("all_difference_count", 0)),
+        "all_difference_rate": summary.get("all_difference_rate_vs_union", 0),
+        "illion_only_count": int(summary.get("reference_only_count", 0)),
+        "finv_only_count": int(summary.get("candidate_only_count", 0)),
+    }
+
+    categories: list[dict[str, Any]] = []
+    if not category_comparison.empty:
+        for _, row in category_comparison.iterrows():
+            categories.append({
+                "name": str(row.get("Category", "")),
+                "priority": str(row.get("建议优先级", "P3")),
+                "illion_count": _monitor_int(row, f"{r}数量"),
+                "finv_count": _monitor_int(row, f"{c}数量"),
+                "illion_coverage": _monitor_float(row, f"{r}覆盖率"),
+                "finv_coverage": _monitor_float(row, f"{c}覆盖率"),
+                "union_count": _monitor_int(row, "并集数量"),
+                "intersection_count": _monitor_int(row, "一致数量"),
+                "illion_only_count": _monitor_int(row, f"{r}侧差异数"),
+                "finv_only_count": _monitor_int(row, f"{c}数量") - _monitor_int(row, "一致数量"),
+                "intersection_share": _monitor_float(row, "交集占比（并集）"),
+                "illion_only_share": _monitor_float(row, f"{r}独有占比（并集）"),
+                "finv_only_share": _monitor_float(row, f"{c}独有占比（并集）"),
+                "diff_count": _monitor_int(row, f"{r}侧差异数"),
+                "diff_rate": _monitor_float(row, f"{r}侧差异率"),
+            })
+
+    engines: list[dict[str, Any]] = []
+    if "classification_engine" in prepared_df.columns:
+        engine_counts = (
+            prepared_df["classification_engine"]
+            .fillna("None")
+            .value_counts()
+        )
+        total = int(engine_counts.sum())
+        for name, count in engine_counts.items():
+            engines.append({
+                "name": str(name),
+                "count": int(count),
+                "rate": count / total if total else 0.0,
+            })
+
+    snapshot = {
+        "run_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "total_rows": int(summary.get("total_rows", 0)),
+        "summary": summary_block,
+        "categories": categories,
+        "engines": engines,
+    }
+
+    with open(_SNAPSHOT_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
+
+
+def _monitor_int(row: pd.Series, col: str, default: int = 0) -> int:
+    if col not in row.index:
+        return default
+    val = row[col]
+    if pd.isna(val):
+        return default
+    return int(val)
+
+
+def _monitor_float(row: pd.Series, col: str, default: float = 0.0) -> float:
+    if col not in row.index:
+        return default
+    val = row[col]
+    if pd.isna(val):
+        return default
+    return float(val)
+
+
+def _load_monitor_history() -> list[dict[str, Any]]:
+    """Load all snapshots, oldest first."""
+    if not _SNAPSHOT_PATH.exists():
+        return []
+    history: list[dict[str, Any]] = []
+    with open(_SNAPSHOT_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                history.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return history
+
+
+def _monitor_font_for_change(
+    current: float, previous: float, good_direction: str
+) -> Font:
+    """Green/red Font for change cells. good_direction: "up" or "down"."""
+    if previous == 0:
+        return BODY_FONT
+    delta = current - previous
+    if abs(delta) < 0.001:
+        return BODY_FONT
+    improved = delta < 0 if good_direction == "down" else delta > 0
+    return Font(
+        name=EXCEL_FONT_NAME, size=BODY_FONT_SIZE,
+        bold=True, color=GREEN if improved else RED,
+    )
+
+
+def _write_monitor_sheet(
+    writer,
+    summary: dict[str, Any],
+    category_comparison: pd.DataFrame,
+    prepared_df: pd.DataFrame,
+    config: ReportConfig,
+) -> None:
+    """Write ``04_模型监控`` sheet."""
+    book = writer.book
+    sheet_name = "04_模型监控"
+    if sheet_name in book.sheetnames:
+        del book[sheet_name]
+    ws = book.create_sheet(sheet_name)
+
+    end_col = 14
+    subtitle = f"illion vs finv 差异变化趋势 | 快照: {_SNAPSHOT_PATH}"
+    style_title(ws, "模型监控", subtitle, end_col=end_col)
+    configure_sheet_view(ws, freeze_panes="A5")
+
+    row = 4
+    style_section_title(ws, row, "1. 整体差异指标趋势", end_col)
+
+    history = _load_monitor_history()
+    if len(history) < 2:
+        row += 1
+        cell = ws.cell(row, 1,
+            "首次运行，无历史对比数据。关键指标快照已保存至 .monitor/snapshots.jsonl")
+        cell.font = Font(name=EXCEL_FONT_NAME, size=BODY_FONT_SIZE, italic=True, color=BLACK)
+        ws.sheet_properties.tabColor = ORANGE
+        return
+
+    # Merge history + current into one list
+    all_runs = history + [{
+        "run_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "total_rows": int(summary.get("total_rows", 0)),
+        "summary": _monitor_summary_block(summary),
+        "categories": _monitor_categories_block(category_comparison, config),
+        "engines": _monitor_engines_block(prepared_df),
+    }]
+
+    # ---- Table 1: Overall trend --------------------------------------------
+    headers1 = [
+        "运行时间", "总交易数", "Illion覆盖率", "finv覆盖率",
+        "覆盖调整一致率", "差异总数", "差异率",
+    ]
+    hdr = row + 1
+    for ci, h in enumerate(headers1, 1):
+        ws.cell(hdr, ci, h)
+    style_header(ws, hdr)
+
+    for i, snap in enumerate(all_runs):
+        r = hdr + 1 + i
+        s = snap["summary"]
+        ws.cell(r, 1, snap["run_time"])
+        ws.cell(r, 2, snap["total_rows"])
+        ws.cell(r, 3, _pct(s["illion_coverage"]))
+        ws.cell(r, 4, _pct(s["finv_coverage"]))
+        ws.cell(r, 5, _pct(s["coverage_adjusted_agreement"]))
+        ws.cell(r, 6, s["all_difference_count"])
+        ws.cell(r, 7, _pct(s["all_difference_rate"]))
+        for ci in range(1, len(headers1) + 1):
+            cell = ws.cell(r, ci)
+            cell.font = BODY_FONT
+            cell.border = BORDER
+            cell.alignment = BODY_ALIGNMENT
+
+    # Highlight the last row as "current"
+    last_r = hdr + len(all_runs)
+    for ci in range(1, len(headers1) + 1):
+        ws.cell(last_r, ci).fill = PatternFill("solid", fgColor="E2EFDA")
+
+    # Color the diff count change
+    if len(all_runs) >= 2:
+        prev_diff = int(ws.cell(last_r - 1, 6).value or 0)
+        curr_diff = int(ws.cell(last_r, 6).value or 0)
+        dc = ws.cell(last_r, 6)
+        if curr_diff < prev_diff:
+            dc.fill = PatternFill("solid", fgColor=LIGHT_GREEN)
+        elif curr_diff > prev_diff:
+            dc.fill = PatternFill("solid", fgColor=LIGHT_RED)
+
+    # ---- Table 2: Per-category trend (prev vs current) ---------------------
+    row = hdr + len(all_runs) + 2
+    style_section_title(ws, row, "2. 各类别指标趋势（上次 vs 本次）", end_col)
+
+    prev_snap = all_runs[-2]
+    curr_snap = all_runs[-1]
+    prev_cats = {c["name"]: c for c in prev_snap.get("categories", [])}
+    curr_cats = {c["name"]: c for c in curr_snap.get("categories", [])}
+
+    cat_names = sorted(
+        set(prev_cats.keys()) | set(curr_cats.keys()),
+        key=lambda n: ({"P1": 0, "P2": 1, "P3": 2}.get(
+            curr_cats.get(n, {}).get("priority", "P3"), 3), n.casefold()),
+    )
+
+    headers2 = [
+        "类别", "优先级",
+        "finv数量(上次)", "finv数量(本次)",
+        "交集数量(上次)", "交集数量(本次)",
+        "Illion独有(上次)", "Illion独有(本次)",
+        "finv独有(上次)", "finv独有(本次)",
+        "交集占比(上次)", "交集占比(本次)",
+        "差异率(上次)", "差异率(本次)",
+    ]
+    cat_hdr = row + 1
+    for ci, h in enumerate(headers2, 1):
+        ws.cell(cat_hdr, ci, h)
+    style_header(ws, cat_hdr)
+
+    for i, name in enumerate(cat_names):
+        r = cat_hdr + 1 + i
+        prev = prev_cats.get(name, {})
+        curr = curr_cats.get(name, {})
+        pri = curr.get("priority", prev.get("priority", "P3"))
+
+        ws.cell(r, 1, name)
+        ws.cell(r, 2, pri)
+
+        # finv count -- up is better
+        ws.cell(r, 3, prev.get("finv_count", 0))
+        ws.cell(r, 4, curr.get("finv_count", 0))
+        ws.cell(r, 4).font = _monitor_font_for_change(
+            curr.get("finv_count", 0), prev.get("finv_count", 0), "up")
+
+        # intersection -- up is better
+        ws.cell(r, 5, prev.get("intersection_count", 0))
+        ws.cell(r, 6, curr.get("intersection_count", 0))
+        ws.cell(r, 6).font = _monitor_font_for_change(
+            curr.get("intersection_count", 0), prev.get("intersection_count", 0), "up")
+
+        # illion only (missing) -- down is better
+        ws.cell(r, 7, prev.get("illion_only_count", 0))
+        ws.cell(r, 8, curr.get("illion_only_count", 0))
+        ws.cell(r, 8).font = _monitor_font_for_change(
+            curr.get("illion_only_count", 0), prev.get("illion_only_count", 0), "down")
+
+        # finv only
+        ws.cell(r, 9, prev.get("finv_only_count", 0))
+        ws.cell(r, 10, curr.get("finv_only_count", 0))
+
+        # intersection share -- up is better
+        ws.cell(r, 11, _pct(prev.get("intersection_share", 0)))
+        ws.cell(r, 12, _pct(curr.get("intersection_share", 0)))
+        ws.cell(r, 12).font = _monitor_font_for_change(
+            curr.get("intersection_share", 0), prev.get("intersection_share", 0), "up")
+
+        # diff rate -- down is better
+        ws.cell(r, 13, _pct(prev.get("diff_rate", 0)))
+        ws.cell(r, 14, _pct(curr.get("diff_rate", 0)))
+        ws.cell(r, 14).font = _monitor_font_for_change(
+            curr.get("diff_rate", 0), prev.get("diff_rate", 0), "down")
+
+        for ci in range(1, len(headers2) + 1):
+            cell = ws.cell(r, ci)
+            cell.border = BORDER
+            cell.alignment = BODY_ALIGNMENT
+            cell.font = BODY_FONT
+
+        # Priority fill
+        pri_fill = {"P1": LIGHT_RED, "P2": "FFF2CC", "P3": LIGHT_GREEN}.get(pri, WHITE)
+        ws.cell(r, 2).fill = PatternFill("solid", fgColor=pri_fill)
+        ws.cell(r, 2).font = Font(name=EXCEL_FONT_NAME, size=BODY_FONT_SIZE, bold=True,
+                                  color=RED if pri == "P1" else BLACK)
+
+    # ---- Table 3: Heatmap of diff rates across all runs ---------------------
+    row = cat_hdr + len(cat_names) + 2
+    style_section_title(ws, row, "3. 各类别差异率趋势热力图", end_col)
+
+    run_labels = [s["run_time"][:10] for s in all_runs]
+    all_cat_rates: dict[str, list[float]] = {}
+    priorities: dict[str, str] = {}
+    for snap in all_runs:
+        for c in snap.get("categories", []):
+            name = c["name"]
+            if name not in all_cat_rates:
+                all_cat_rates[name] = []
+                priorities[name] = c.get("priority", "P3")
+            all_cat_rates[name].append(c.get("diff_rate", 0))
+
+    n_runs = len(all_runs)
+    for name in all_cat_rates:
+        while len(all_cat_rates[name]) < n_runs:
+            all_cat_rates[name].append(0.0)
+
+    pri_order = {"P1": 0, "P2": 1, "P3": 2}
+    cat_order = sorted(
+        all_cat_rates.keys(),
+        key=lambda n: (
+            pri_order.get(priorities.get(n, "P3"), 3),
+            -(all_cat_rates[n][-1] if all_cat_rates[n] else 0),
+            n.casefold(),
+        ),
+    )
+
+    heat_headers = ["类别", "优先级"] + run_labels + ["趋势"]
+    heat_hdr = row + 1
+    for ci, h in enumerate(heat_headers, 1):
+        ws.cell(heat_hdr, ci, h)
+    style_header(ws, heat_hdr)
+
+    for i, name in enumerate(cat_order):
+        r = heat_hdr + 1 + i
+        ws.cell(r, 1, name)
+        ws.cell(r, 2, priorities.get(name, "P3"))
+        rates = all_cat_rates[name]
+        for j, rate in enumerate(rates):
+            ws.cell(r, 3 + j, _pct(rate))
+        # Trend arrow
+        if len(rates) >= 2 and rates[-2] > 0:
+            change = rates[-1] - rates[-2]
+            if abs(change) < 0.01:
+                trend = "→"
+            elif change < 0:
+                trend = "↓"
+            else:
+                trend = "↑"
+            tc = ws.cell(r, 3 + n_runs)
+            tc.value = trend
+            tc.font = Font(name=EXCEL_FONT_NAME, size=12, bold=True,
+                           color=GREEN if trend == "↓" else (RED if trend == "↑" else BLACK))
+
+        for ci in range(1, len(heat_headers) + 1):
+            cell = ws.cell(r, ci)
+            cell.font = BODY_FONT
+            cell.border = BORDER
+            cell.alignment = BODY_ALIGNMENT
+
+        # Priority fill
+        pri = priorities.get(name, "P3")
+        pri_fill = {"P1": LIGHT_RED, "P2": "FFF2CC", "P3": LIGHT_GREEN}.get(pri, WHITE)
+        ws.cell(r, 2).fill = PatternFill("solid", fgColor=pri_fill)
+        ws.cell(r, 2).font = Font(name=EXCEL_FONT_NAME, size=BODY_FONT_SIZE, bold=True,
+                                  color=RED if pri == "P1" else BLACK)
+
+        # Color rates: >=50% red, >=30% yellow, <30% green
+        for ci in range(3, 3 + n_runs):
+            cell = ws.cell(r, ci)
+            try:
+                val = float(str(cell.value).rstrip("%")) / 100 if cell.value else 0
+                if val >= 0.5:
+                    cell.fill = PatternFill("solid", fgColor=LIGHT_RED)
+                elif val >= 0.3:
+                    cell.fill = PatternFill("solid", fgColor="FFF2CC")
+                else:
+                    cell.fill = PatternFill("solid", fgColor=LIGHT_GREEN)
+            except (ValueError, AttributeError):
+                pass
+
+    # ---- Table 4: Engine hit rate trend ------------------------------------
+    row = heat_hdr + len(cat_order) + 2
+    style_section_title(ws, row, "4. 引擎命中率趋势", end_col)
+
+    engine_names: list[str] = []
+    for snap in all_runs:
+        for e in snap.get("engines", []):
+            if e["name"] not in engine_names:
+                engine_names.append(e["name"])
+
+    eng_headers = ["引擎"] + run_labels
+    eng_hdr = row + 1
+    for ci, h in enumerate(eng_headers, 1):
+        ws.cell(eng_hdr, ci, h)
+    style_header(ws, eng_hdr)
+
+    for i, eng_name in enumerate(engine_names):
+        r = eng_hdr + 1 + i
+        ws.cell(r, 1, eng_name)
+        for j, snap in enumerate(all_runs):
+            eng_map = {e["name"]: e["rate"] for e in snap.get("engines", [])}
+            ws.cell(r, 2 + j, _pct(eng_map.get(eng_name, 0)))
+        for ci in range(1, len(eng_headers) + 1):
+            cell = ws.cell(r, ci)
+            cell.font = BODY_FONT
+            cell.border = BORDER
+            cell.alignment = BODY_ALIGNMENT
+        # Highlight None engine with red if > 10%
+        if eng_name == "None":
+            for ci in range(2, 2 + n_runs):
+                cell = ws.cell(r, ci)
+                try:
+                    val = float(str(cell.value).rstrip("%")) / 100 if cell.value else 0
+                    if val > 0.10:
+                        cell.fill = PatternFill("solid", fgColor=LIGHT_RED)
+                        cell.font = Font(name=EXCEL_FONT_NAME, size=BODY_FONT_SIZE, bold=True, color=RED)
+                except (ValueError, AttributeError):
+                    pass
+
+    ws.column_dimensions["A"].width = 28
+    for ci in range(2, end_col + 1):
+        ws.column_dimensions[get_column_letter(ci)].width = 16
+    ws.sheet_properties.tabColor = ORANGE
+
+
+def _pct(value: float) -> str:
+    return f"{value:.2%}"
+
+
+def _monitor_summary_block(summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "illion_coverage": summary.get("reference_coverage", 0),
+        "finv_coverage": summary.get("candidate_coverage", 0),
+        "agreement_rate": summary.get("agreement_rate_when_both_nonempty", 0),
+        "mismatch_count": int(summary.get("mismatch_count", 0)),
+        "mismatch_rate": summary.get("mismatch_rate_when_both_nonempty", 0),
+        "coverage_adjusted_agreement": summary.get("coverage_adjusted_agreement", 0),
+        "all_difference_count": int(summary.get("all_difference_count", 0)),
+        "all_difference_rate": summary.get("all_difference_rate_vs_union", 0),
+        "illion_only_count": int(summary.get("reference_only_count", 0)),
+        "finv_only_count": int(summary.get("candidate_only_count", 0)),
+    }
+
+
+def _monitor_categories_block(
+    category_comparison: pd.DataFrame, config: ReportConfig,
+) -> list[dict[str, Any]]:
+    r = config.reference_label
+    c = config.candidate_label
+    cats: list[dict[str, Any]] = []
+    if not category_comparison.empty:
+        for _, row in category_comparison.iterrows():
+            cats.append({
+                "name": str(row.get("Category", "")),
+                "priority": str(row.get("建议优先级", "P3")),
+                "illion_count": _monitor_int(row, f"{r}数量"),
+                "finv_count": _monitor_int(row, f"{c}数量"),
+                "illion_coverage": _monitor_float(row, f"{r}覆盖率"),
+                "finv_coverage": _monitor_float(row, f"{c}覆盖率"),
+                "union_count": _monitor_int(row, "并集数量"),
+                "intersection_count": _monitor_int(row, "一致数量"),
+                "illion_only_count": _monitor_int(row, f"{r}侧差异数"),
+                "finv_only_count": _monitor_int(row, f"{c}数量") - _monitor_int(row, "一致数量"),
+                "intersection_share": _monitor_float(row, "交集占比（并集）"),
+                "illion_only_share": _monitor_float(row, f"{r}独有占比（并集）"),
+                "finv_only_share": _monitor_float(row, f"{c}独有占比（并集）"),
+                "diff_count": _monitor_int(row, f"{r}侧差异数"),
+                "diff_rate": _monitor_float(row, f"{r}侧差异率"),
+            })
+    return cats
+
+
+def _monitor_engines_block(prepared_df: pd.DataFrame) -> list[dict[str, Any]]:
+    engines: list[dict[str, Any]] = []
+    if "classification_engine" in prepared_df.columns:
+        engine_counts = (
+            prepared_df["classification_engine"]
+            .fillna("None")
+            .value_counts()
+        )
+        total = int(engine_counts.sum())
+        for name, count in engine_counts.items():
+            engines.append({
+                "name": str(name),
+                "count": int(count),
+                "rate": count / total if total else 0.0,
+            })
+    return engines
 
 
 if __name__ == "__main__":
