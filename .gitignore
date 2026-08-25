@@ -21,3 +21,7 @@ Thumbs.db
 
 # Output reports
 *.xlsx
+
+# Local demo and monitoring artifacts
+demo/
+.monitor/
